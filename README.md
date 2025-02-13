@@ -1,4 +1,3 @@
-```markdown
 # Script de traducción de datasets para Hugging Face
 
 Este repositorio contiene un script de Python (`main.py`) que te ayudará a:

@@ -1,2 +1,5 @@
 boto3
 datasets
+huggingface_hub
+tqdm
+pyyaml

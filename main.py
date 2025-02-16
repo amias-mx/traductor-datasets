@@ -4,7 +4,6 @@ import os
 import tempfile
 import shutil
 from tqdm import tqdm
-import time
 import boto3
 import subprocess
 import argparse
@@ -22,19 +21,57 @@ def create_aws_translate_client(region_name=None):
 def translate_text(text: str, client, source_lang="en", target_lang="es") -> str:
     """
     Translates a single text string using AWS Translate.
-    Includes rate limiting and error handling.
+    Handles texts longer than AWS limits by splitting them.
     """
     if not text or not isinstance(text, str):
         return text
+        
     try:
-        # Rate limiting to avoid AWS Translate throttling
-        time.sleep(0.1)
-        response = client.translate_text(
-            Text=text,
-            SourceLanguageCode=source_lang,
-            TargetLanguageCode=target_lang
-        )
-        return response["TranslatedText"]
+        # AWS Translate has a 10,000 byte limit per request
+        MAX_LENGTH = 9000  # Using 9000 to be safe with UTF-8 encoding
+        
+        # If text is within limits, translate directly
+        if len(text) <= MAX_LENGTH:
+            response = client.translate_text(
+                Text=text,
+                SourceLanguageCode=source_lang,
+                TargetLanguageCode=target_lang
+            )
+            return response["TranslatedText"]
+            
+        # For longer texts, split by sentences and translate in chunks
+        chunks = []
+        current_chunk = ""
+        
+        # Simple sentence splitting
+        sentences = text.replace('\n', '. ').replace('? ', '. ').replace('! ', '. ').split('. ')
+        
+        for sentence in sentences:
+            if not sentence.strip():
+                continue
+                
+            if len(current_chunk) + len(sentence) + 2 <= MAX_LENGTH:
+                current_chunk += sentence + '. '
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence + '. '
+                
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+            
+        # Translate each chunk
+        translated_chunks = []
+        for chunk in chunks:
+            response = client.translate_text(
+                Text=chunk,
+                SourceLanguageCode=source_lang,
+                TargetLanguageCode=target_lang
+            )
+            translated_chunks.append(response["TranslatedText"])
+            
+        return ' '.join(translated_chunks)
+        
     except Exception as e:
         print(f"Error translating: {str(e)}")
         return text
@@ -82,44 +119,49 @@ def prepare_repository(repo_dir, repo_name, token=None):
         print(f"Error setting up repository: {str(e)}")
         return False
 
-def save_dataset_as_parquet(dataset, save_path):
-    """Save dataset in Parquet format"""
-    # Clean any problematic columns
-    if '_format_kwargs' in dataset.features:
-        dataset = dataset.remove_columns(['_format_kwargs'])
-    
-    # Create directory if it doesn't exist
-    os.makedirs(save_path, exist_ok=True)
-    
-    # Save as parquet
-    dataset.to_parquet(f"{save_path}/data.parquet")
-
-def create_dataset_yaml(work_dir, selected_configs, ds):
-    """Creates the dataset.yaml file with proper config structure"""
-    yaml_content = {
-        "configs": [
-            {
-                "config_name": cfg if cfg else "main",
-                "data_files": {
-                    split: f"{cfg if cfg else 'main'}/{split}/data.parquet"
-                    for split in (ds.keys() if isinstance(ds, dict) else ['train'])
-                }
-            }
-            for cfg in selected_configs
-        ]
+def create_readme_and_yaml(work_dir, selected_configs, datasets_dict, dataset_id):
+    """
+    Creates a README.md file and a dataset.yaml file with dataset information.
+    Combines functionality to avoid duplication.
+    """
+    # Dataset YAML Configurations
+    dataset_yaml_content = {
+        "configs": []
     }
 
-    yaml_path = os.path.join(work_dir, "dataset.yaml")
-    with open(yaml_path, "w", encoding='utf-8') as f:
-        yaml.dump(yaml_content, f, allow_unicode=True)
+    for cfg in selected_configs:
+        cfg_name = cfg if cfg else "default"
+        ds = datasets_dict.get(cfg_name, {})
 
-def create_readme(work_dir, dataset_id):
-    """Creates a README.md file with dataset information"""
-    readme_content = f"""\
----
-license: cc-by-4.0
+        config_entry = {
+            "config_name": cfg_name,
+            "data_files": []
+        }
+
+        # Handle both Dataset and DatasetDict cases
+        splits = ds.keys() if isinstance(ds, dict) else ['train']
+        for split in splits:
+            config_entry["data_files"].append({
+                "split": split,
+                "path": f"configs/{cfg_name}/{split}.parquet"
+            })
+
+        dataset_yaml_content["configs"].append(config_entry)
+
+    # Serialize YAML content
+    dataset_yaml_str = yaml.dump(dataset_yaml_content, allow_unicode=True, default_flow_style=False).strip()
+
+    # YAML Header
+    yaml_header = f"""
+{dataset_yaml_str}
 language:
 - es
+license: cc-by-4.0"""
+
+    # README Content
+    readme_content = f"""\
+---
+{yaml_header}
 ---
 # Dataset Translation
 
@@ -131,10 +173,17 @@ Each subset is preserved as a separate config, maintaining the original structur
 **Note**: The translations are generated using machine translation and may contain
 typical automated translation artifacts.
 """
-    
+
+    # Write README.md
     readme_path = os.path.join(work_dir, "README.md")
     with open(readme_path, "w", encoding='utf-8') as f:
         f.write(readme_content)
+
+    # Write dataset.yaml
+    yaml_path = os.path.join(work_dir, "dataset.yaml")
+    with open(yaml_path, "w", encoding='utf-8') as f:
+        f.write(dataset_yaml_str)
+
 
 def main():
     # Parse command line arguments
@@ -151,12 +200,24 @@ def main():
     # 2. Get configs
     try:
         configs = get_dataset_config_names(dataset_id)
+        print("\nAvailable configs:", configs if configs else ["default"])
         
         if args.test:
-            print("\nTest mode: Will only process the first config")
-            selected_configs = [configs[0]] if configs else [None]
+            print("\nTest mode: Will only process up to 2 configs")
+            selected_configs = configs[:2] if configs else [None]
         else:
-            selected_configs = configs if configs else [None]
+            config_input = input("Enter config numbers to process (comma-separated) or 'all': ").strip()
+            if config_input.lower() == 'all':
+                selected_configs = configs if configs else [None]
+            elif config_input.strip():
+                try:
+                    indices = [int(i.strip()) for i in config_input.split(',')]
+                    selected_configs = [configs[i] for i in indices]
+                except (ValueError, IndexError):
+                    print("Invalid config selection")
+                    return
+            else:
+                selected_configs = [None]  # Default config
             
         print(f"\nSelected configs: {selected_configs}")
         
@@ -167,13 +228,44 @@ def main():
     # 3. Load first config to get columns
     try:
         ds = load_dataset(dataset_id, selected_configs[0] if configs else None)
-        first_split = next(iter(ds.values())) if isinstance(ds, dict) else ds
+        if isinstance(ds, dict):
+            if not ds:
+                print("Error: Dataset is empty")
+                return
+            first_split = next(iter(ds.values()))
+        else:
+            first_split = ds
+            
         columns = first_split.column_names
+        if not columns:
+            print("Error: No columns found in dataset")
+            return
+            
         print("\nAvailable columns:", columns)
-        cols_to_translate = input("Enter column numbers to translate (comma-separated) or 'all': ")
-        selected_cols = columns if cols_to_translate.lower() == 'all' else \
-                       [columns[int(i)] for i in cols_to_translate.split(',')]
+        print("Column numbers:", {i: col for i, col in enumerate(columns)})
         
+        cols_to_translate = input("Enter column numbers to translate (comma-separated) or 'all': ").strip()
+        if not cols_to_translate:
+            print("Error: No columns selected")
+            return
+            
+        try:
+            if cols_to_translate.lower() == 'all':
+                selected_cols = columns
+            else:
+                indices = [int(i.strip()) for i in cols_to_translate.split(',')]
+                if not all(0 <= i < len(columns) for i in indices):
+                    print("Error: Some column numbers are out of range")
+                    return
+                selected_cols = [columns[i] for i in indices]
+        except ValueError:
+            print("Error: Invalid column numbers")
+            return
+            
+        if not selected_cols:
+            print("Error: No valid columns selected")
+            return
+            
         print(f"\nSelected columns: {selected_cols}")
     except Exception as e:
         print(f"Error loading dataset: {str(e)}")
@@ -196,14 +288,17 @@ def main():
 
     try:
         # 7. Process each config
+        datasets_dict = {}
         for config in tqdm(selected_configs, desc="Configs"):
             try:
                 # Load dataset
                 ds = load_dataset(dataset_id, config)
+                cfg_name = config if config else "main"
+                datasets_dict[cfg_name] = ds
                 
                 # Process each split
                 for split_name, split_ds in (ds.items() if isinstance(ds, dict) else [('train', ds)]):
-                    print(f"\nTranslating {config if config else 'main'} - {split_name}")
+                    print(f"\nTranslating {cfg_name} - {split_name}")
                     translated = split_ds.map(
                         lambda x: translate_batch(x, selected_cols, client),
                         batched=True,
@@ -211,22 +306,18 @@ def main():
                         desc=f"Translating {split_name}"
                     )
                     
-                    # Save in Parquet format
-                    save_path = os.path.join(work_dir, 
-                                           config if config else 'main',
-                                           split_name)
-                    save_dataset_as_parquet(translated, save_path)
+                # Save in Parquet format with proper directory structure
+                save_path = os.path.join(work_dir, "configs", cfg_name)
+                os.makedirs(save_path, exist_ok=True)
+                translated.to_parquet(f"{save_path}/{split_name}.parquet")
 
             except Exception as e:
                 print(f"Error processing {config}: {str(e)}")
                 continue
 
         # 8. Create necessary files
-        print("\nCreating dataset.yaml...")
-        create_dataset_yaml(work_dir, selected_configs, ds)
-        
-        print("Creating README.md...")
-        create_readme(work_dir, dataset_id)
+        print("\nCreating README.md and dataset.yaml...")
+        create_readme_and_yaml(work_dir, selected_configs, datasets_dict, dataset_id)
 
         # 9. Handle repository
         print("\nPreparing to upload to Hugging Face...")

@@ -65,17 +65,43 @@ Este repositorio contiene un script de Python (`main.py`) que te ayudará a:
 
 ## Uso
 
-### Modo normal
-Para procesar todos los subsets del dataset:
+### Modos de ejecución
 ```bash
+# Modo normal
 python main.py
+
+# Modo de prueba (2 subsets, 10 filas cada uno)
+python main.py --test
+
+# Especificar número de reintentos para AWS Translate
+python main.py --retries 5
+
+# Reanudar un proceso interrumpido
+python main.py --resume
 ```
 
-### Modo de prueba
-Para procesar solo el primer subset (útil para probar la configuración):
-```bash
-python main.py --test
-```
+### Parámetros disponibles
+- `--test`: Ejecuta en modo de prueba (2 subsets, 10 filas cada uno)
+- `--retries N`: Número de reintentos para AWS Translate (por defecto: 3)
+- `--resume`: Reanuda un proceso interrumpido previamente
+
+### Funcionalidades nuevas
+
+#### 1. Pausa y reanudación
+- Puedes interrumpir el proceso en cualquier momento con Ctrl+C
+- El progreso se guarda automáticamente
+- Usa `--resume` para continuar desde donde lo dejaste
+- Al reanudar, deberás proporcionar la ruta del directorio de trabajo anterior
+
+#### 2. Reintentos de traducción
+- Configura el número de reintentos para AWS Translate con `--retries`
+- Por defecto, realizará 3 intentos antes de saltar un texto
+- Útil para manejar errores temporales de red o límites de API
+
+#### 3. Modo de prueba mejorado
+- Procesa solo 2 subsets del dataset
+- Limita cada subset a 10 filas
+- Ideal para probar la configuración y el flujo de trabajo
 
 ### Pasos del asistente
 
@@ -87,7 +113,7 @@ python main.py --test
    - Si el dataset tiene múltiples subsets, podrás:
      - Seleccionar todos con `"all"`
      - Elegir específicos con índices (ej: `0,2,3`)
-     - En modo prueba (`--test`), solo se procesará el primero
+     - En modo prueba (`--test`), solo se procesarán dos
 
 3. **Selección de columnas**  
    - Verás una lista de columnas disponibles
@@ -124,6 +150,8 @@ repositorio/
 - Si falla la subida a Hugging Face, los archivos se guardan localmente como respaldo
 - Cada error de traducción se registra pero no detiene el proceso
 - El script incluye rate limiting para evitar límites de AWS
+- Los errores de traducción se reintentan según el parámetro `--retries`
+- Se mantiene un registro del progreso para poder reanudar en caso de interrupción
 
 ## Licencia
 

@@ -1,30 +1,24 @@
 #!/usr/bin/env python3
-import sys
 import os
 import tempfile
 import shutil
 import json
+import ast
+import time
 from tqdm import tqdm
 import boto3
 import subprocess
 import argparse
 import yaml
-from datasets import load_dataset, get_dataset_config_names
+from datasets import load_dataset, get_dataset_config_names, concatenate_datasets
 from huggingface_hub import login
 
 def create_aws_translate_client(region_name=None):
-    """
-    Creates and returns an AWS Translate client.
-    If region_name is None, environment variables or ~/.aws/config will be used.
-    """
+    """Creates and returns an AWS Translate client."""
     return boto3.client("translate", region_name=region_name)
 
-def translate_text(text: str, client, source_lang="en", target_lang="es", max_retries=3) -> str:
-    """
-    Translates a single text string using AWS Translate.
-    Handles texts longer than AWS limits by splitting them.
-    Includes retry logic for failed requests.
-    """
+def translate_text(text, client, source_lang="en", target_lang="es", max_retries=3):
+    """Translates a single text string using AWS Translate."""
     if not text or not isinstance(text, str):
         return text
         
@@ -45,8 +39,6 @@ def translate_text(text: str, client, source_lang="en", target_lang="es", max_re
             # For longer texts, split by sentences and translate in chunks
             chunks = []
             current_chunk = ""
-            
-            # Simple sentence splitting
             sentences = text.replace('\n', '. ').replace('? ', '. ').replace('! ', '. ').split('. ')
             
             for sentence in sentences:
@@ -81,6 +73,24 @@ def translate_text(text: str, client, source_lang="en", target_lang="es", max_re
                 return text
             print(f"Attempt {attempt + 1} failed, retrying...")
 
+def translate_python_literal_conversation(conv_str, client, max_retries=3):
+    """Translates conversations in Python literal format."""
+    try:
+        # Parse using Python's built-in literal parser
+        conversations = ast.literal_eval(conv_str)
+        
+        # Process each conversation entry
+        for entry in conversations:
+            if 'value' in entry and entry['value']:
+                # Only translate the 'value' field
+                entry['value'] = translate_text(entry['value'], client, max_retries=max_retries)
+        
+        # Return as Python literal string
+        return str(conversations)
+    except Exception as e:
+        print(f"Error processing conversation: {str(e)}")
+        return conv_str
+
 def save_progress(work_dir, config, split, current_row, selected_cols, dataset_id=None, configs=None):
     """Save current progress to a JSON file"""
     progress = {
@@ -89,24 +99,65 @@ def save_progress(work_dir, config, split, current_row, selected_cols, dataset_i
         'config': config,
         'split': split,
         'current_row': current_row,
-        'selected_cols': selected_cols
+        'selected_cols': selected_cols,
+        'timestamp': time.time()
     }
-    with open(os.path.join(work_dir, 'progress.json'), 'w') as f:
-        json.dump(progress, f)
+    
+    try:
+        # First ensure the directory exists
+        if not os.path.exists(work_dir):
+            os.makedirs(work_dir, exist_ok=True)
+            print(f"Created directory: {work_dir}")
+            
+        progress_file = os.path.join(work_dir, 'progress.json')
+        with open(progress_file, 'w') as f:
+            json.dump(progress, f)
+        
+        # Verify the file was written
+        if os.path.exists(progress_file):
+            print(f"Progress saved to {progress_file}")
+        else:
+            print(f"Warning: Progress file was not saved properly")
+    except Exception as e:
+        print(f"Error saving progress: {str(e)}")
 
 def load_progress(work_dir):
     """Load progress from JSON file"""
     try:
-        with open(os.path.join(work_dir, 'progress.json'), 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
+        progress_file = os.path.join(work_dir, 'progress.json')
+        if os.path.exists(progress_file):
+            with open(progress_file, 'r') as f:
+                return json.load(f)
+        else:
+            print(f"Progress file not found at: {progress_file}")
+            return None
+    except Exception as e:
+        print(f"Error loading progress: {str(e)}")
         return None
 
 def translate_batch(batch, selected_cols, client, max_retries):
     """Translates a batch of texts for selected columns"""
     for col in selected_cols:
         if col in batch:
-            batch[col] = [translate_text(str(txt), client, max_retries=max_retries) for txt in batch[col]]
+            # Check if column is 'conversations' which has Python literals
+            if col == "conversations":
+                # Print debug info for the first item in the batch
+                if len(batch[col]) > 0:
+                    print(f"Processing conversation: {str(batch[col][0])[:100]}...")
+                
+                # Translate each conversation
+                batch[col] = [translate_python_literal_conversation(str(txt), client, max_retries=max_retries) 
+                             for txt in batch[col]]
+            
+            # For system column with same value, translate once
+            elif col == "system" and all(txt == batch[col][0] for txt in batch[col]):
+                system_text = str(batch[col][0])
+                print(f"Processing system prompt: {system_text[:100]}...")
+                translated = translate_text(system_text, client, max_retries=max_retries)
+                batch[col] = [translated] * len(batch[col])
+            else:
+                batch[col] = [translate_text(str(txt), client, max_retries=max_retries) 
+                             for txt in batch[col]]
     return batch
 
 def get_full_repo_url(repo_name):
@@ -143,10 +194,8 @@ def prepare_repository(repo_dir, repo_name, token=None):
         print(f"Error setting up repository: {str(e)}")
         return False
 
-def create_readme_and_yaml(work_dir, selected_configs, datasets_dict, dataset_id):
-    """
-    Creates README.md and dataset.yaml files with dataset information
-    """
+def create_readme_and_yaml(work_dir, selected_configs, dataset_id):
+    """Creates README.md and dataset.yaml files with dataset information"""
     # Dataset YAML Configurations
     dataset_yaml_content = {
         "configs": []
@@ -154,15 +203,21 @@ def create_readme_and_yaml(work_dir, selected_configs, datasets_dict, dataset_id
 
     for cfg in selected_configs:
         cfg_name = cfg if cfg else "default"
-        ds = datasets_dict.get(cfg_name, {})
-
+        
+        # Find all available splits for this config
+        config_dir = os.path.join(work_dir, "configs", cfg_name)
+        splits = []
+        if os.path.exists(config_dir):
+            for file in os.listdir(config_dir):
+                if file.endswith(".parquet") and not file.startswith("chunk_"):
+                    splits.append(file.replace(".parquet", ""))
+        
         config_entry = {
             "config_name": cfg_name,
             "data_files": []
         }
 
-        # Handle both Dataset and DatasetDict cases
-        splits = ds.keys() if isinstance(ds, dict) else ['train']
+        # Add found splits
         for split in splits:
             config_entry["data_files"].append({
                 "split": split,
@@ -205,23 +260,70 @@ typical automated translation artifacts.
 
 def main():
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Translate HuggingFace datasets')
+    parser = argparse.ArgumentParser(description='Translate HuggingFace datasets with incremental saving')
     parser.add_argument('--test', action='store_true', help='Test mode: process only two subsets with 10 rows each')
     parser.add_argument('--retries', type=int, default=3, help='Number of retries for AWS Translate')
-    parser.add_argument('--resume', action='store_true', help='Resume from last saved progress')
+    parser.add_argument('--resume', action='store_true', help='Resume from a previous run')
+    parser.add_argument('--chunk-size', type=int, default=100, help='Number of examples to process before saving')
     args = parser.parse_args()
 
     # Get or create work directory
     if args.resume:
         work_dir = input("Enter the path to the previous work directory: ").strip()
+        # Remove quotes if they were added
+        work_dir = work_dir.strip('"\'')
+        
         if not os.path.exists(work_dir):
-            print("Work directory not found")
+            print(f"Work directory not found: {work_dir}")
+            print("Please check the path and try again.")
             return
+        elif not os.path.isdir(work_dir):
+            print(f"The path exists but is not a directory: {work_dir}")
+            return
+        else:
+            print(f"Found work directory: {work_dir}")
     else:
-        work_dir = tempfile.mkdtemp(prefix='translation_work_')
+        # Create temporary directory
+        try:
+            work_dir = tempfile.mkdtemp(prefix='translation_work_')
+            
+            # Test write access
+            test_file = os.path.join(work_dir, 'test_file.txt')
+            with open(test_file, 'w') as f:
+                f.write('Test write access')
+                
+            # Verify the directory exists and has write access
+            if os.path.exists(test_file):
+                os.remove(test_file)
+                print(f"\nCreated temporary work directory: {work_dir}")
+                print("If process is interrupted, use this path with --resume to continue")
+            else:
+                print(f"Failed to verify write access to temporary directory")
+                return
+        except Exception as e:
+            print(f"Error creating temporary directory: {str(e)}")
+            print("Using current directory as fallback")
+            work_dir = os.path.join(os.getcwd(), f"translation_work_{int(time.time())}")
+            os.makedirs(work_dir, exist_ok=True)
+            print(f"Created work directory: {work_dir}")
 
     # Load progress if resuming
-    progress = load_progress(work_dir) if args.resume else None
+    progress = None
+    if args.resume:
+        progress = load_progress(work_dir)
+        if progress is None:
+            print("No valid progress file found. Starting a new translation process.")
+            print("Continue with this directory? (y/n):")
+            if input().strip().lower() != 'y':
+                print("Exiting. Please restart with a new directory.")
+                return
+        else:
+            print(f"Resuming translation of dataset: {progress['dataset_id']}")
+            print(f"Config: {progress['config']}")
+            print(f"Split: {progress['split']}")
+            print(f"Continuing from example: {progress['current_row']}")
+            print(f"Columns: {progress['selected_cols']}")
+            print("")
 
     # Get dataset info if not resuming
     if not progress:
@@ -232,7 +334,11 @@ def main():
 
         try:
             configs = get_dataset_config_names(dataset_id)
-            print("\nAvailable configs:", configs if configs else ["default"])
+            print("\nAvailable configs:")
+            for i, config in enumerate(configs):
+                print(f"  [{i}] {config}")
+            if not configs:
+                print("  [default]")
             
             if args.test:
                 print("\nTest mode: Will process only 2 configs with 10 rows each")
@@ -251,21 +357,25 @@ def main():
             
             # Get columns
             ds = load_dataset(dataset_id, selected_configs[0] if configs else None)
+            
+            # Simplify to handle dictionary datasets (with splits) consistently
             if isinstance(ds, dict):
-                if not ds:
-                    print("Error: Dataset is empty")
-                    return
-                first_split = next(iter(ds.values()))
+                splits = list(ds.keys())
+                first_split = ds[splits[0]]
             else:
+                splits = ["train"]  # Default split name if not a dictionary
                 first_split = ds
+                
+            print(f"\nAvailable splits: {splits}")
                 
             columns = first_split.column_names
             if not columns:
                 print("Error: No columns found in dataset")
                 return
                 
-            print("\nAvailable columns:", columns)
-            print("Column numbers:", {i: col for i, col in enumerate(columns)})
+            print("\nAvailable columns:")
+            for i, col in enumerate(columns):
+                print(f"  [{i}] {col}")
             
             cols_input = input("Enter column numbers to translate (comma-separated) or 'all': ").strip()
             if not cols_input:
@@ -283,6 +393,10 @@ def main():
                 
             print(f"\nSelected columns: {selected_cols}")
             
+            # Write initial progress
+            save_progress(work_dir, selected_configs[0], splits[0], 0, 
+                         selected_cols, dataset_id, selected_configs)
+                
         except Exception as e:
             print(f"Error setting up dataset: {str(e)}")
             return
@@ -304,65 +418,137 @@ def main():
 
     # Create repository directory
     repo_dir = tempfile.mkdtemp(prefix='hf_repo_')
+    
+    # Set the chunk size - smaller in test mode
+    chunk_size = 5 if args.test else args.chunk_size
+    print(f"Using chunk size of {chunk_size} examples")
 
     try:
-        # Process each config
-        datasets_dict = {}
+        # Determine starting point from progress file
         start_config = progress['config'] if progress else selected_configs[0]
         config_idx = selected_configs.index(start_config)
-
-        for config in tqdm(selected_configs[config_idx:], desc="Configs"):
-            try:
-                # Load dataset
-                ds = load_dataset(dataset_id, config)
-                cfg_name = config if config else "main"
+        
+        # Process each config
+        for config in selected_configs[config_idx:]:
+            # Load dataset
+            print(f"\nLoading dataset with config: {config}")
+            ds = load_dataset(dataset_id, config)
+            
+            # Make naming consistent
+            config_name = config if config else "default"
+            
+            # Handle both dictionary and non-dictionary datasets
+            if isinstance(ds, dict):
+                splits_to_process = list(ds.keys())
+            else:
+                splits_to_process = ["train"]
+                ds = {"train": ds}  # Convert to dictionary format for consistent handling
+            
+            # If resuming, find which split to start with
+            if progress and progress['config'] == config:
+                split_idx = splits_to_process.index(progress['split'])
+                splits_to_process = splits_to_process[split_idx:]
+            
+            # Process each split
+            for split_name in splits_to_process:
+                print(f"\nTranslating {config_name} - {split_name}")
+                split_ds = ds[split_name]
                 
+                # Apply test limit if needed
                 if args.test:
-                    # In test mode, limit to 10 rows
-                    if isinstance(ds, dict):
-                        ds = {k: v.select(range(min(10, len(v)))) for k, v in ds.items()}
-                    else:
-                        ds = ds.select(range(min(10, len(ds))))
+                    split_ds = split_ds.select(range(min(10, len(split_ds))))
                 
-                datasets_dict[cfg_name] = ds
+                # Get total examples
+                total_examples = len(split_ds)
+                print(f"Total examples in this split: {total_examples}")
                 
-                # Process each split
-                for split_name, split_ds in (ds.items() if isinstance(ds, dict) else [('train', ds)]):
-                    print(f"\nTranslating {cfg_name} - {split_name}")
+                # Determine starting point
+                start_idx = 0
+                if progress and progress['config'] == config and progress['split'] == split_name:
+                    start_idx = progress['current_row']
+                    print(f"Resuming from example {start_idx}/{total_examples}")
+                
+                # Create save directory
+                save_path = os.path.join(work_dir, "configs", config_name)
+                os.makedirs(save_path, exist_ok=True)
+                
+                # Process in chunks
+                for chunk_start in range(start_idx, total_examples, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, total_examples)
+                    print(f"\nProcessing examples {chunk_start} to {chunk_end-1}")
+                    
+                    # Select subset for this chunk
+                    chunk_ds = split_ds.select(range(chunk_start, chunk_end))
                     
                     try:
-                        translated = split_ds.map(
+                        # Translate chunk
+                        translated_chunk = chunk_ds.map(
                             lambda x: translate_batch(x, selected_cols, client, args.retries),
                             batched=True,
-                            batch_size=8,
-                            desc=f"Translating {split_name}"
+                            batch_size=64,
+                            desc=f"Translating {split_name} (examples {chunk_start}-{chunk_end-1})"
                         )
                         
-                        # Save progress after each batch
-                        save_progress(work_dir, config, split_name, 0, selected_cols, dataset_id, selected_configs)
+                        # Save chunk to a temporary file
+                        chunk_file = f"{save_path}/chunk_{split_name}_{chunk_start}_{chunk_end}.parquet"
+                        translated_chunk.to_parquet(chunk_file)
+                        print(f"Saved chunk to {chunk_file}")
                         
-                        # Save the translated data
-                        save_path = os.path.join(work_dir, "configs", cfg_name)
-                        os.makedirs(save_path, exist_ok=True)
-                        translated.to_parquet(f"{save_path}/{split_name}.parquet")
+                        # Update progress
+                        save_progress(work_dir, config, split_name, chunk_end, selected_cols, dataset_id, selected_configs)
+                        print(f"Progress updated: {chunk_end}/{total_examples} examples processed")
                         
                     except KeyboardInterrupt:
-                        print("\nProcess interrupted. Progress saved.")
-                        return
-
-            except Exception as e:
-                print(f"Error processing {config}: {str(e)}")
-                continue
-
-        # Create necessary files
+                        print("\nProcess interrupted.")
+                        save_progress(work_dir, config, split_name, chunk_start, selected_cols, dataset_id, selected_configs)
+                        print(f"Progress saved at example {chunk_start}")
+                        raise
+                
+                # After processing all chunks, combine them
+                print(f"\nCombining chunks for {config_name} - {split_name}...")
+                try:
+                    # List all chunk files
+                    chunk_files = []
+                    for filename in os.listdir(save_path):
+                        if filename.startswith(f"chunk_{split_name}_") and filename.endswith(".parquet"):
+                            chunk_files.append(os.path.join(save_path, filename))
+                    
+                    # Sort chunk files by their starting index
+                    chunk_files.sort(key=lambda x: int(x.split('_')[-2]))
+                    
+                    if chunk_files:
+                        # Combine chunks into a single dataset
+                        all_chunks = []
+                        for chunk_file in chunk_files:
+                            chunk_ds = load_dataset("parquet", data_files=chunk_file)
+                            if isinstance(chunk_ds, dict):
+                                chunk_ds = next(iter(chunk_ds.values()))
+                            all_chunks.append(chunk_ds)
+                        
+                        # Concatenate and save
+                        if all_chunks:
+                            combined_ds = concatenate_datasets(all_chunks)
+                            final_path = f"{save_path}/{split_name}.parquet"
+                            combined_ds.to_parquet(final_path)
+                            print(f"Saved complete translated data to {final_path}")
+                            
+                            # Clean up chunk files
+                            for chunk_file in chunk_files:
+                                os.remove(chunk_file)
+                            print("Cleaned up temporary chunk files")
+                except Exception as e:
+                    print(f"Error combining chunks: {str(e)}")
+                    print("Individual chunk files are preserved for manual recovery if needed")
+        
+        # Create the final metadata files
         print("\nCreating README.md and dataset.yaml...")
-        create_readme_and_yaml(work_dir, selected_configs, datasets_dict, dataset_id)
-
+        create_readme_and_yaml(work_dir, selected_configs, dataset_id)
+        
         # Handle repository
         print("\nPreparing to upload to Hugging Face...")
         if token:
             login(token=token)
-
+        
         # Set up repository
         if not prepare_repository(repo_dir, repo_name, token):
             print("Failed to set up repository. Saving files locally instead.")
@@ -370,7 +556,7 @@ def main():
             shutil.copytree(work_dir, backup_dir)
             print(f"Files saved to: {backup_dir}")
             return
-
+        
         # Copy files to repository
         print("\nCopying files to repository...")
         for item in os.listdir(work_dir):
@@ -382,7 +568,7 @@ def main():
                 shutil.copytree(src, dst)
             else:
                 shutil.copy2(src, dst)
-
+        
         # Push to Hugging Face
         print("\nPushing to Hugging Face...")
         try:
@@ -395,21 +581,21 @@ def main():
             backup_dir = os.path.join(os.getcwd(), "translated_dataset_backup")
             shutil.copytree(work_dir, backup_dir)
             print(f"Files saved locally to: {backup_dir}")
-
+    
     except KeyboardInterrupt:
         print("\nProcess interrupted. Progress saved.")
+        print(f"\nTo resume translation, run:")
+        print(f"python {os.path.basename(__file__)} --resume")
+        print(f"And enter this work directory path when prompted:")
+        print(f"{work_dir}")
+        
         if not args.resume:
             backup_dir = os.path.join(os.getcwd(), "translated_dataset_backup")
-            shutil.copytree(work_dir, backup_dir)
-            print(f"Files saved locally to: {backup_dir}")
-    finally:
-        # Clean up temporary directories only if not resuming
-        if not args.resume:
             try:
-                shutil.rmtree(repo_dir)
-                shutil.rmtree(work_dir)
-            except:
-                pass
+                shutil.copytree(work_dir, backup_dir)
+                print(f"Files also backed up locally to: {backup_dir}")
+            except Exception as e:
+                print(f"Could not create backup: {str(e)}")
 
 if __name__ == "__main__":
     main()

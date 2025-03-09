@@ -171,3 +171,4 @@ cython_debug/
 .pypirc
 
 dataset_traducido
+translated_dataset_backup

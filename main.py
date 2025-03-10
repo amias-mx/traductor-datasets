@@ -12,6 +12,8 @@ import argparse
 import yaml
 from datasets import load_dataset, get_dataset_config_names, concatenate_datasets
 from huggingface_hub import login
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 
 def create_aws_translate_client(region_name=None):
     """Creates and returns an AWS Translate client."""
@@ -73,6 +75,60 @@ def translate_text(text, client, source_lang="en", target_lang="es", max_retries
                 return text
             print(f"Attempt {attempt + 1} failed, retrying...")
 
+def batch_translate_texts(texts, client, source_lang="en", target_lang="es", max_retries=3, batch_size=5):
+    """
+    Batch translate texts using AWS Translate BatchTranslate API.
+    
+    This function improves efficiency by combining multiple short texts
+    into a single API call using a special delimiter.
+    """
+    if not texts:
+        return texts
+        
+    # Filter out None or empty strings
+    valid_texts = [(i, text) for i, text in enumerate(texts) if text and isinstance(text, str)]
+    
+    if not valid_texts:
+        return texts
+        
+    result = list(texts)  # Create a copy of the original list
+    
+    # Process in batches
+    for i in range(0, len(valid_texts), batch_size):
+        batch = valid_texts[i:i+batch_size]
+        indices = [idx for idx, _ in batch]
+        batch_texts = [text for _, text in batch]
+        
+        # Special delimiter unlikely to appear in normal text and preserved during translation
+        delimiter = "|||SPLIT|||"
+        
+        # Only combine short texts that won't exceed limits when combined
+        if all(len(text) < 1000 for _, text in batch) and sum(len(text) for _, text in batch) < 8000:
+            # Combine texts with delimiter
+            combined_text = delimiter.join(batch_texts)
+            
+            # Translate the combined text
+            translated_combined = translate_text(combined_text, client, source_lang, target_lang, max_retries)
+            
+            # Split the translated text
+            if translated_combined and delimiter in translated_combined:
+                translated_texts = translated_combined.split(delimiter)
+                
+                # Update results
+                for j, translated in enumerate(translated_texts):
+                    if j < len(indices):
+                        result[indices[j]] = translated
+            else:
+                # Fallback to individual translation if delimiter handling failed
+                for idx, text in batch:
+                    result[idx] = translate_text(text, client, source_lang, target_lang, max_retries)
+        else:
+            # For longer texts, translate individually
+            for idx, text in batch:
+                result[idx] = translate_text(text, client, source_lang, target_lang, max_retries)
+    
+    return result
+
 def translate_python_literal_conversation(conv_str, client, max_retries=3):
     """Translates conversations in Python literal format."""
     try:
@@ -90,6 +146,102 @@ def translate_python_literal_conversation(conv_str, client, max_retries=3):
     except Exception as e:
         print(f"Error processing conversation: {str(e)}")
         return conv_str
+
+def translate_batch(batch, selected_cols, client, max_retries, translation_cache=None, 
+                use_parallel=False, workers=10, use_batching=False, batch_size=5):
+    """
+    Translates a batch of texts for selected columns
+    Supports both parallel and sequential processing with optional caching
+    """
+    for col in selected_cols:
+        if col in batch:
+            # Check if column is 'conversations' which has Python literals
+            if col == "conversations":
+                # Print debug info for the first item in the batch
+                if len(batch[col]) > 0:
+                    try:
+                        conv_str = str(batch[col][0])
+                        print(f"Processing conversation (ID: {batch.get('id', ['unknown'])[0]}):")
+                        # Print first 500 chars to avoid overwhelming the console
+                        print(f"{conv_str[:500]}...")
+                        if len(conv_str) > 500:
+                            print(f"[...truncated, full length: {len(conv_str)} chars]")
+                        print("-" * 80)
+                    except Exception as e:
+                        print(f"Error displaying conversation: {e}")
+                
+                # Translate conversations (with or without parallelization)
+                if use_parallel:
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = [
+                            executor.submit(translate_python_literal_conversation, str(txt), client, max_retries)
+                            for txt in batch[col]
+                        ]
+                        batch[col] = [future.result() for future in concurrent.futures.as_completed(futures)]
+                else:
+                    batch[col] = [
+                        translate_python_literal_conversation(str(txt), client, max_retries=max_retries) 
+                        for txt in batch[col]
+                    ]
+            
+            # For system column with same value, translate once
+            elif col == "system" and all(txt == batch[col][0] for txt in batch[col]):
+                system_text = str(batch[col][0])
+                
+                # Check cache for system prompt
+                translated = None
+                cache_key = f"en:es:{system_text}"
+                
+                if translation_cache is not None and cache_key in translation_cache:
+                    translated = translation_cache[cache_key]
+                    print(f"USING CACHED system prompt (hash: {hash(system_text) % 10000}):")
+                else:
+                    print(f"NEW system prompt (hash: {hash(system_text) % 10000}):")
+                    # Translate and cache
+                    translated = translate_text(system_text, client, max_retries=max_retries)
+                    if translation_cache is not None:
+                        translation_cache[cache_key] = translated
+                
+                # Print first 100 chars to avoid overwhelming console
+                print(f"First 100 chars: {system_text[:100]}...")
+                print("-" * 80)
+                
+                batch[col] = [translated] * len(batch[col])
+            else:
+                # Process regular text fields
+                texts = [str(txt) for txt in batch[col]]
+                
+                if use_batching:
+                    # Use batching for short texts
+                    batch[col] = batch_translate_texts(
+                        texts, client, max_retries=max_retries, batch_size=batch_size
+                    )
+                elif use_parallel:
+                    # Use parallel processing
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        future_to_idx = {
+                            executor.submit(translate_text, text, client, "en", "es", max_retries): i
+                            for i, text in enumerate(texts)
+                        }
+                        
+                        result = [None] * len(texts)
+                        for future in concurrent.futures.as_completed(future_to_idx):
+                            idx = future_to_idx[future]
+                            try:
+                                result[idx] = future.result()
+                            except Exception as e:
+                                print(f"Error in translation: {str(e)}")
+                                result[idx] = texts[idx]  # Keep original on error
+                        
+                        batch[col] = result
+                else:
+                    # Simple sequential processing
+                    batch[col] = [
+                        translate_text(str(txt), client, max_retries=max_retries) 
+                        for txt in batch[col]
+                    ]
+    
+    return batch
 
 def save_progress(work_dir, config, split, current_row, selected_cols, dataset_id=None, configs=None):
     """Save current progress to a JSON file"""
@@ -134,31 +286,6 @@ def load_progress(work_dir):
     except Exception as e:
         print(f"Error loading progress: {str(e)}")
         return None
-
-def translate_batch(batch, selected_cols, client, max_retries):
-    """Translates a batch of texts for selected columns"""
-    for col in selected_cols:
-        if col in batch:
-            # Check if column is 'conversations' which has Python literals
-            if col == "conversations":
-                # Print debug info for the first item in the batch
-                if len(batch[col]) > 0:
-                    print(f"Processing conversation: {str(batch[col][0])[:100]}...")
-                
-                # Translate each conversation
-                batch[col] = [translate_python_literal_conversation(str(txt), client, max_retries=max_retries) 
-                             for txt in batch[col]]
-            
-            # For system column with same value, translate once
-            elif col == "system" and all(txt == batch[col][0] for txt in batch[col]):
-                system_text = str(batch[col][0])
-                print(f"Processing system prompt: {system_text[:100]}...")
-                translated = translate_text(system_text, client, max_retries=max_retries)
-                batch[col] = [translated] * len(batch[col])
-            else:
-                batch[col] = [translate_text(str(txt), client, max_retries=max_retries) 
-                             for txt in batch[col]]
-    return batch
 
 def get_full_repo_url(repo_name):
     """Convert repo name to full Hugging Face URL"""
@@ -265,6 +392,11 @@ def main():
     parser.add_argument('--retries', type=int, default=3, help='Number of retries for AWS Translate')
     parser.add_argument('--resume', action='store_true', help='Resume from a previous run')
     parser.add_argument('--chunk-size', type=int, default=100, help='Number of examples to process before saving')
+    parser.add_argument('--parallel', action='store_true', help='Use parallel processing for translation')
+    parser.add_argument('--batch', action='store_true', help='Use batch translation for multiple texts')
+    parser.add_argument('--workers', type=int, default=10, help='Number of worker threads for parallel processing')
+    parser.add_argument('--batch-size', type=int, default=5, help='Number of texts to combine in batch translation')
+    parser.add_argument('--global-cache', action='store_true', help='Enable global caching of repetitive content', default=True)
     args = parser.parse_args()
 
     # Get or create work directory
@@ -419,10 +551,52 @@ def main():
     # Create repository directory
     repo_dir = tempfile.mkdtemp(prefix='hf_repo_')
     
+    # Initialize global translation cache for repetitive content
+    translation_cache = {} if args.global_cache else None
+    
     # Set the chunk size - smaller in test mode
     chunk_size = 5 if args.test else args.chunk_size
     print(f"Using chunk size of {chunk_size} examples")
-
+    
+    # Print parallelization info
+    if args.parallel:
+        print(f"Using parallel processing with {args.workers} workers")
+        if args.batch:
+            print(f"Using batch translation with batch size of {args.batch_size}")
+    
+    # Load the initial config to check system prompt before main processing
+    if not progress and not args.test and args.global_cache:
+        try:
+            print("\nPre-caching system prompts...")
+            ds = load_dataset(dataset_id, selected_configs[0] if selected_configs else None)
+            
+            # Handle both dictionary and non-dictionary datasets
+            if isinstance(ds, dict):
+                first_split = next(iter(ds.values()))
+            else:
+                first_split = ds
+                
+            # Check if 'system' is in the columns and pre-cache it
+            if 'system' in selected_cols and 'system' in first_split.column_names:
+                # Get the first row's system prompt
+                system_text = str(first_split[0]['system'])
+                print(f"Found system prompt (hash: {hash(system_text) % 10000}):")
+                print(f"First 100 chars: {system_text[:100]}...")
+                
+                # Translate and cache
+                translated = translate_text(system_text, client, max_retries=args.retries)
+                cache_key = f"en:es:{system_text}"
+                translation_cache[cache_key] = translated
+                print("System prompt pre-cached for faster processing")
+            else:
+                print("No system prompt found for pre-caching")
+                
+        except Exception as e:
+            print(f"Error during pre-caching: {e}")
+            print("Continuing with normal processing...")
+            
+    print("\nBeginning translation process...")
+    
     try:
         # Determine starting point from progress file
         start_config = progress['config'] if progress else selected_configs[0]
@@ -481,9 +655,19 @@ def main():
                     chunk_ds = split_ds.select(range(chunk_start, chunk_end))
                     
                     try:
-                        # Translate chunk
+                        # Choose translation method based on args
                         translated_chunk = chunk_ds.map(
-                            lambda x: translate_batch(x, selected_cols, client, args.retries),
+                            lambda x: translate_batch(
+                                x, 
+                                selected_cols, 
+                                client, 
+                                args.retries,
+                                translation_cache=translation_cache,
+                                use_parallel=args.parallel,
+                                workers=args.workers,
+                                use_batching=args.batch,
+                                batch_size=args.batch_size
+                            ),
                             batched=True,
                             batch_size=64,
                             desc=f"Translating {split_name} (examples {chunk_start}-{chunk_end-1})"

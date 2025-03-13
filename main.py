@@ -12,12 +12,29 @@ import argparse
 import yaml
 from datasets import load_dataset, get_dataset_config_names, concatenate_datasets
 from huggingface_hub import login
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+import openai
 
 def create_aws_translate_client(region_name=None):
     """Creates and returns an AWS Translate client."""
     return boto3.client("translate", region_name=region_name)
 
-def translate_text(text, client, source_lang="en", target_lang="es", max_retries=3):
+def create_openai_client(api_key):
+    """Creates and returns an OpenAI client."""
+    return openai.OpenAI(api_key=api_key)
+
+def translate_text(text, client, source_lang="en", target_lang="es", max_retries=3, provider="aws"):
+    """Translates a single text string using the selected provider."""
+    if not text or not isinstance(text, str):
+        return text
+    
+    if provider == "openai":
+        return translate_text_openai(text, client, source_lang, target_lang, max_retries)
+    else:  # default to AWS
+        return translate_text_aws(text, client, source_lang, target_lang, max_retries)
+
+def translate_text_aws(text, client, source_lang="en", target_lang="es", max_retries=3):
     """Translates a single text string using AWS Translate."""
     if not text or not isinstance(text, str):
         return text
@@ -73,7 +90,146 @@ def translate_text(text, client, source_lang="en", target_lang="es", max_retries
                 return text
             print(f"Attempt {attempt + 1} failed, retrying...")
 
-def translate_python_literal_conversation(conv_str, client, max_retries=3):
+def translate_text_openai(text, client, source_lang="en", target_lang="es", max_retries=3):
+    """Translates a single text string using OpenAI API."""
+    if not text or not isinstance(text, str):
+        return text
+        
+    for attempt in range(max_retries):
+        try:
+            # Set a token limit to avoid exceeding OpenAI's limits
+            MAX_TOKENS = 4000  # Adjust based on OpenAI model limits
+            
+            # If text is short enough, translate directly
+            if len(text) / 4 < MAX_TOKENS:  # rough character to token ratio
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",  # or any preferred model
+                    messages=[
+                        {"role": "system", "content": f"You are a professional translator. Translate the following text from {source_lang} to {target_lang}. Preserve formatting, markdown, and special characters. Only return the translated text without explanations."},
+                        {"role": "user", "content": text}
+                    ],
+                    temperature=0.3  # Lower temperature for more consistent translations
+                )
+                return response.choices[0].message.content
+                
+            # For longer texts, split by paragraphs or sentences
+            chunks = []
+            current_chunk = ""
+            paragraphs = text.split('\n\n')
+            
+            for paragraph in paragraphs:
+                if not paragraph.strip():
+                    continue
+                    
+                # If paragraph is too long, split by sentences
+                if len(paragraph) / 4 > MAX_TOKENS:
+                    sentences = paragraph.replace('. ', '.\n').replace('? ', '?\n').replace('! ', '!\n').split('\n')
+                    for sentence in sentences:
+                        if not sentence.strip():
+                            continue
+                        if len(current_chunk) + len(sentence) + 2 < MAX_TOKENS * 4:  # rough estimate
+                            current_chunk += sentence + ' '
+                        else:
+                            if current_chunk:
+                                chunks.append(current_chunk.strip())
+                            current_chunk = sentence + ' '
+                else:
+                    if len(current_chunk) + len(paragraph) + 4 < MAX_TOKENS * 4:  # rough estimate
+                        current_chunk += paragraph + '\n\n'
+                    else:
+                        if current_chunk:
+                            chunks.append(current_chunk.strip())
+                        current_chunk = paragraph + '\n\n'
+                    
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                
+            # Translate each chunk
+            translated_chunks = []
+            for chunk in chunks:
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",  # or any preferred model
+                    messages=[
+                        {"role": "system", "content": f"You are a professional translator. Translate the following text from {source_lang} to {target_lang}. Preserve formatting, markdown, and special characters. Only return the translated text without explanations."},
+                        {"role": "user", "content": chunk}
+                    ],
+                    temperature=0.3  # Lower temperature for more consistent translations
+                )
+                translated_chunks.append(response.choices[0].message.content)
+                
+            # Combine translated chunks
+            if len(chunks) > 1:
+                # For multiple paragraph chunks, join with newlines
+                return '\n\n'.join(translated_chunks)
+            else:
+                # For single chunk, return as is
+                return translated_chunks[0]
+            
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"Error translating with OpenAI after {max_retries} attempts: {str(e)}")
+                return text
+            print(f"OpenAI translation attempt {attempt + 1} failed, retrying...")
+            time.sleep(2)  # Add delay to respect rate limits
+
+def batch_translate_texts(texts, client, source_lang="en", target_lang="es", max_retries=3, batch_size=5, provider="aws"):
+    """
+    Batch translate texts using selected translation provider.
+    """
+    if not texts:
+        return texts
+        
+    # Filter out None or empty strings
+    valid_texts = [(i, text) for i, text in enumerate(texts) if text and isinstance(text, str)]
+    
+    if not valid_texts:
+        return texts
+        
+    result = list(texts)  # Create a copy of the original list
+    
+    # For OpenAI, don't use batching
+    if provider == "openai":
+        for idx, text in valid_texts:
+            result[idx] = translate_text(text, client, source_lang, target_lang, max_retries, provider="openai")
+        return result
+    
+    # Process in batches for AWS
+    for i in range(0, len(valid_texts), batch_size):
+        batch = valid_texts[i:i+batch_size]
+        indices = [idx for idx, _ in batch]
+        batch_texts = [text for _, text in batch]
+        
+        # Special delimiter unlikely to appear in normal text and preserved during translation
+        delimiter = "|||SPLIT|||"
+        
+        # Only combine short texts that won't exceed limits when combined
+        if all(len(text) < 1000 for _, text in batch) and sum(len(text) for _, text in batch) < 8000:
+            # Combine texts with delimiter
+            combined_text = delimiter.join(batch_texts)
+            
+            # Translate the combined text
+            translated_combined = translate_text(combined_text, client, source_lang, target_lang, max_retries, provider="aws")
+            
+            # Split the translated text
+            if translated_combined and delimiter in translated_combined:
+                translated_texts = translated_combined.split(delimiter)
+                
+                # Update results
+                for j, translated in enumerate(translated_texts):
+                    if j < len(indices):
+                        result[indices[j]] = translated
+            else:
+                # Fallback to individual translation if delimiter handling failed
+                for idx, text in batch:
+                    result[idx] = translate_text(text, client, source_lang, target_lang, max_retries, provider="aws")
+        else:
+            # For longer texts, translate individually
+            for idx, text in batch:
+                result[idx] = translate_text(text, client, source_lang, target_lang, max_retries, provider="aws")
+    
+    return result
+
+def translate_python_literal_conversation(conv_str, client, max_retries=3, provider="aws"):
     """Translates conversations in Python literal format."""
     try:
         # Parse using Python's built-in literal parser
@@ -83,7 +239,7 @@ def translate_python_literal_conversation(conv_str, client, max_retries=3):
         for entry in conversations:
             if 'value' in entry and entry['value']:
                 # Only translate the 'value' field
-                entry['value'] = translate_text(entry['value'], client, max_retries=max_retries)
+                entry['value'] = translate_text(entry['value'], client, max_retries=max_retries, provider=provider)
         
         # Return as Python literal string
         return str(conversations)
@@ -91,7 +247,102 @@ def translate_python_literal_conversation(conv_str, client, max_retries=3):
         print(f"Error processing conversation: {str(e)}")
         return conv_str
 
-def save_progress(work_dir, config, split, current_row, selected_cols, dataset_id=None, configs=None):
+def translate_batch(batch, selected_cols, client, max_retries, translation_cache=None, 
+                use_parallel=False, workers=10, use_batching=False, batch_size=5, provider="aws"):
+    """
+    Translates a batch of texts for selected columns
+    """
+    for col in selected_cols:
+        if col in batch:
+            # Check if column is 'conversations' which has Python literals
+            if col == "conversations":
+                # Print debug info for the first item in the batch
+                if len(batch[col]) > 0:
+                    try:
+                        conv_str = str(batch[col][0])
+                        print(f"Processing conversation (ID: {batch.get('id', ['unknown'])[0]}):")
+                        # Print first 500 chars to avoid overwhelming the console
+                        print(f"{conv_str[:500]}...")
+                        if len(conv_str) > 500:
+                            print(f"[...truncated, full length: {len(conv_str)} chars]")
+                        print("-" * 80)
+                    except Exception as e:
+                        print(f"Error displaying conversation: {e}")
+                
+                # Translate conversations (with or without parallelization)
+                if use_parallel:
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = [
+                            executor.submit(translate_python_literal_conversation, str(txt), client, max_retries, provider)
+                            for txt in batch[col]
+                        ]
+                        batch[col] = [future.result() for future in concurrent.futures.as_completed(futures)]
+                else:
+                    batch[col] = [
+                        translate_python_literal_conversation(str(txt), client, max_retries=max_retries, provider=provider) 
+                        for txt in batch[col]
+                    ]
+            
+            # For system column with same value, translate once
+            elif col == "system" and all(txt == batch[col][0] for txt in batch[col]):
+                system_text = str(batch[col][0])
+                
+                # Check cache for system prompt
+                translated = None
+                cache_key = f"{provider}:{system_text}"
+                
+                if translation_cache is not None and cache_key in translation_cache:
+                    translated = translation_cache[cache_key]
+                    print(f"USING CACHED system prompt (hash: {hash(system_text) % 10000}):")
+                else:
+                    print(f"NEW system prompt (hash: {hash(system_text) % 10000}):")
+                    # Translate and cache
+                    translated = translate_text(system_text, client, max_retries=max_retries, provider=provider)
+                    if translation_cache is not None:
+                        translation_cache[cache_key] = translated
+                
+                # Print first 100 chars to avoid overwhelming console
+                print(f"First 100 chars: {system_text[:100]}...")
+                print("-" * 80)
+                
+                batch[col] = [translated] * len(batch[col])
+            else:
+                # Process regular text fields
+                texts = [str(txt) for txt in batch[col]]
+                
+                if use_batching and provider == "aws":
+                    # Use batching for short texts (AWS only)
+                    batch[col] = batch_translate_texts(
+                        texts, client, max_retries=max_retries, batch_size=batch_size, provider=provider
+                    )
+                elif use_parallel:
+                    # Use parallel processing
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        future_to_idx = {
+                            executor.submit(translate_text, text, client, "en", "es", max_retries, provider): i
+                            for i, text in enumerate(texts)
+                        }
+                        
+                        result = [None] * len(texts)
+                        for future in concurrent.futures.as_completed(future_to_idx):
+                            idx = future_to_idx[future]
+                            try:
+                                result[idx] = future.result()
+                            except Exception as e:
+                                print(f"Error in translation: {str(e)}")
+                                result[idx] = texts[idx]  # Keep original on error
+                        
+                        batch[col] = result
+                else:
+                    # Simple sequential processing
+                    batch[col] = [
+                        translate_text(str(txt), client, max_retries=max_retries, provider=provider) 
+                        for txt in batch[col]
+                    ]
+    
+    return batch
+
+def save_progress(work_dir, config, split, current_row, selected_cols, dataset_id=None, configs=None, provider="aws"):
     """Save current progress to a JSON file"""
     progress = {
         'dataset_id': dataset_id,
@@ -100,6 +351,7 @@ def save_progress(work_dir, config, split, current_row, selected_cols, dataset_i
         'split': split,
         'current_row': current_row,
         'selected_cols': selected_cols,
+        'provider': provider,
         'timestamp': time.time()
     }
     
@@ -135,31 +387,6 @@ def load_progress(work_dir):
         print(f"Error loading progress: {str(e)}")
         return None
 
-def translate_batch(batch, selected_cols, client, max_retries):
-    """Translates a batch of texts for selected columns"""
-    for col in selected_cols:
-        if col in batch:
-            # Check if column is 'conversations' which has Python literals
-            if col == "conversations":
-                # Print debug info for the first item in the batch
-                if len(batch[col]) > 0:
-                    print(f"Processing conversation: {str(batch[col][0])[:100]}...")
-                
-                # Translate each conversation
-                batch[col] = [translate_python_literal_conversation(str(txt), client, max_retries=max_retries) 
-                             for txt in batch[col]]
-            
-            # For system column with same value, translate once
-            elif col == "system" and all(txt == batch[col][0] for txt in batch[col]):
-                system_text = str(batch[col][0])
-                print(f"Processing system prompt: {system_text[:100]}...")
-                translated = translate_text(system_text, client, max_retries=max_retries)
-                batch[col] = [translated] * len(batch[col])
-            else:
-                batch[col] = [translate_text(str(txt), client, max_retries=max_retries) 
-                             for txt in batch[col]]
-    return batch
-
 def get_full_repo_url(repo_name):
     """Convert repo name to full Hugging Face URL"""
     return f"https://huggingface.co/datasets/{repo_name}"
@@ -194,7 +421,7 @@ def prepare_repository(repo_dir, repo_name, token=None):
         print(f"Error setting up repository: {str(e)}")
         return False
 
-def create_readme_and_yaml(work_dir, selected_configs, dataset_id):
+def create_readme_and_yaml(work_dir, selected_configs, dataset_id, provider="aws"):
     """Creates README.md and dataset.yaml files with dataset information"""
     # Dataset YAML Configurations
     dataset_yaml_content = {
@@ -237,6 +464,7 @@ language:
 license: cc-by-4.0"""
 
     # README Content
+    translation_method = "OpenAI" if provider == "openai" else "AWS Translate"
     readme_content = f"""\
 ---
 {yaml_header}
@@ -247,6 +475,8 @@ This repository contains the Spanish translation of dataset subsets from
 [{dataset_id}](https://huggingface.co/datasets/{dataset_id}).
 
 Each subset is preserved as a separate config, maintaining the original structure.
+
+**Translation Method**: {translation_method}
 
 **Note**: The translations are generated using machine translation and may contain
 typical automated translation artifacts.
@@ -262,9 +492,15 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Translate HuggingFace datasets with incremental saving')
     parser.add_argument('--test', action='store_true', help='Test mode: process only two subsets with 10 rows each')
-    parser.add_argument('--retries', type=int, default=3, help='Number of retries for AWS Translate')
+    parser.add_argument('--retries', type=int, default=3, help='Number of retries for translation')
     parser.add_argument('--resume', action='store_true', help='Resume from a previous run')
     parser.add_argument('--chunk-size', type=int, default=100, help='Number of examples to process before saving')
+    parser.add_argument('--parallel', action='store_true', help='Use parallel processing for translation')
+    parser.add_argument('--batch', action='store_true', help='Use batch translation for multiple texts')
+    parser.add_argument('--workers', type=int, default=10, help='Number of worker threads for parallel processing')
+    parser.add_argument('--batch-size', type=int, default=5, help='Number of texts to combine in batch translation')
+    parser.add_argument('--global-cache', action='store_true', help='Enable global caching of repetitive content', default=True)
+    parser.add_argument('--provider', choices=['aws', 'openai'], default='aws', help='Translation provider to use')
     args = parser.parse_args()
 
     # Get or create work directory
@@ -286,20 +522,8 @@ def main():
         # Create temporary directory
         try:
             work_dir = tempfile.mkdtemp(prefix='translation_work_')
-            
-            # Test write access
-            test_file = os.path.join(work_dir, 'test_file.txt')
-            with open(test_file, 'w') as f:
-                f.write('Test write access')
-                
-            # Verify the directory exists and has write access
-            if os.path.exists(test_file):
-                os.remove(test_file)
-                print(f"\nCreated temporary work directory: {work_dir}")
-                print("If process is interrupted, use this path with --resume to continue")
-            else:
-                print(f"Failed to verify write access to temporary directory")
-                return
+            print(f"\nCreated temporary work directory: {work_dir}")
+            print("If process is interrupted, use this path with --resume to continue")
         except Exception as e:
             print(f"Error creating temporary directory: {str(e)}")
             print("Using current directory as fallback")
@@ -309,21 +533,59 @@ def main():
 
     # Load progress if resuming
     progress = None
+    provider = args.provider
     if args.resume:
         progress = load_progress(work_dir)
         if progress is None:
             print("No valid progress file found. Starting a new translation process.")
-            print("Continue with this directory? (y/n):")
-            if input().strip().lower() != 'y':
-                print("Exiting. Please restart with a new directory.")
-                return
         else:
             print(f"Resuming translation of dataset: {progress['dataset_id']}")
             print(f"Config: {progress['config']}")
             print(f"Split: {progress['split']}")
             print(f"Continuing from example: {progress['current_row']}")
             print(f"Columns: {progress['selected_cols']}")
+            # Get provider from progress if available
+            provider = progress.get('provider', 'aws')
+            print(f"Translation provider: {provider}")
             print("")
+
+    # Set up the translation client
+    client = None
+    if provider == "openai":
+        # Get OpenAI API key
+        openai_api_key = os.environ.get("OPENAI_API_KEY")
+        if not openai_api_key:
+            openai_api_key = input("Enter OpenAI API key: ").strip()
+            if not openai_api_key:
+                print("No OpenAI API key provided. Falling back to AWS Translate.")
+                provider = "aws"
+                client = create_aws_translate_client()
+            else:
+                try:
+                    client = create_openai_client(openai_api_key)
+                    print("OpenAI client initialized")
+                except Exception as e:
+                    print(f"Error initializing OpenAI client: {str(e)}")
+                    print("Falling back to AWS Translate.")
+                    provider = "aws"
+                    client = create_aws_translate_client()
+        else:
+            try:
+                client = create_openai_client(openai_api_key)
+                print("OpenAI client initialized")
+            except Exception as e:
+                print(f"Error initializing OpenAI client: {str(e)}")
+                print("Falling back to AWS Translate.")
+                provider = "aws"
+                client = create_aws_translate_client()
+    else:
+        # Initialize AWS client
+        try:
+            client = create_aws_translate_client()
+            print("AWS Translate client initialized")
+        except Exception as e:
+            print(f"AWS client error: {str(e)}")
+            return
 
     # Get dataset info if not resuming
     if not progress:
@@ -393,9 +655,34 @@ def main():
                 
             print(f"\nSelected columns: {selected_cols}")
             
+            # Provider selection if not specified by command line
+            if not args.provider:
+                provider_input = input("Select translation provider (aws/openai) [default: aws]: ").strip().lower()
+                if provider_input == "openai":
+                    provider = "openai"
+                    # Get OpenAI API key if not already set
+                    if not client:
+                        openai_api_key = os.environ.get("OPENAI_API_KEY")
+                        if not openai_api_key:
+                            openai_api_key = input("Enter OpenAI API key: ").strip()
+                            if not openai_api_key:
+                                print("No OpenAI API key provided. Falling back to AWS Translate.")
+                                provider = "aws"
+                                client = create_aws_translate_client()
+                            else:
+                                try:
+                                    client = create_openai_client(openai_api_key)
+                                except Exception as e:
+                                    print(f"Error initializing OpenAI client: {str(e)}")
+                                    print("Falling back to AWS Translate.")
+                                    provider = "aws"
+                                    client = create_aws_translate_client()
+            
+            print(f"\nUsing translation provider: {provider}")
+            
             # Write initial progress
             save_progress(work_dir, selected_configs[0], splits[0], 0, 
-                         selected_cols, dataset_id, selected_configs)
+                         selected_cols, dataset_id, selected_configs, provider)
                 
         except Exception as e:
             print(f"Error setting up dataset: {str(e)}")
@@ -409,20 +696,22 @@ def main():
     repo_name = input("Enter HF repository name (username/repo): ").strip()
     token = input("Enter HF token (or press Enter if logged in): ").strip()
 
-    # Initialize AWS client
-    try:
-        client = create_aws_translate_client()
-    except Exception as e:
-        print(f"AWS client error: {str(e)}")
-        return
-
     # Create repository directory
     repo_dir = tempfile.mkdtemp(prefix='hf_repo_')
+    
+    # Initialize global translation cache for repetitive content
+    translation_cache = {} if args.global_cache else None
     
     # Set the chunk size - smaller in test mode
     chunk_size = 5 if args.test else args.chunk_size
     print(f"Using chunk size of {chunk_size} examples")
-
+    
+    # Print parallelization info
+    if args.parallel:
+        print(f"Using parallel processing with {args.workers} workers")
+    
+    print("\nBeginning translation process...")
+    
     try:
         # Determine starting point from progress file
         start_config = progress['config'] if progress else selected_configs[0]
@@ -481,9 +770,20 @@ def main():
                     chunk_ds = split_ds.select(range(chunk_start, chunk_end))
                     
                     try:
-                        # Translate chunk
+                        # Choose translation method based on args
                         translated_chunk = chunk_ds.map(
-                            lambda x: translate_batch(x, selected_cols, client, args.retries),
+                            lambda x: translate_batch(
+                                x, 
+                                selected_cols, 
+                                client, 
+                                args.retries,
+                                translation_cache=translation_cache,
+                                use_parallel=args.parallel,
+                                workers=args.workers,
+                                use_batching=args.batch,
+                                batch_size=args.batch_size,
+                                provider=provider
+                            ),
                             batched=True,
                             batch_size=64,
                             desc=f"Translating {split_name} (examples {chunk_start}-{chunk_end-1})"
@@ -495,12 +795,12 @@ def main():
                         print(f"Saved chunk to {chunk_file}")
                         
                         # Update progress
-                        save_progress(work_dir, config, split_name, chunk_end, selected_cols, dataset_id, selected_configs)
+                        save_progress(work_dir, config, split_name, chunk_end, selected_cols, dataset_id, selected_configs, provider)
                         print(f"Progress updated: {chunk_end}/{total_examples} examples processed")
                         
                     except KeyboardInterrupt:
                         print("\nProcess interrupted.")
-                        save_progress(work_dir, config, split_name, chunk_start, selected_cols, dataset_id, selected_configs)
+                        save_progress(work_dir, config, split_name, chunk_start, selected_cols, dataset_id, selected_configs, provider)
                         print(f"Progress saved at example {chunk_start}")
                         raise
                 
@@ -542,7 +842,7 @@ def main():
         
         # Create the final metadata files
         print("\nCreating README.md and dataset.yaml...")
-        create_readme_and_yaml(work_dir, selected_configs, dataset_id)
+        create_readme_and_yaml(work_dir, selected_configs, dataset_id, provider)
         
         # Handle repository
         print("\nPreparing to upload to Hugging Face...")

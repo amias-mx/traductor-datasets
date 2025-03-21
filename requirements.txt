@@ -3,4 +3,5 @@ datasets
 huggingface_hub
 tqdm
 pyyaml
-tiktoken 
+tiktoken
+openai

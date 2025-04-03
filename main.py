@@ -11,12 +11,13 @@ import boto3
 import subprocess
 import argparse
 import yaml
-from datasets import load_dataset, get_dataset_config_names, concatenate_datasets
+from datasets import load_dataset, get_dataset_config_names, concatenate_datasets, get_dataset_split_names
 from huggingface_hub import login
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import openai
 import tiktoken # Needed for OpenAI token counting
+from typing import Optional, List, Tuple, Any, Dict
 
 # --- Constants ---
 AWS_TRANSLATE_MAX_BYTES = 9900 # Slightly less than 10k limit for safety
@@ -707,18 +708,32 @@ def main():
 
             # Get columns from the first selected config/split
             print("\nFetching column names...")
+            available_columns = [] # Initialize as empty
             try:
-                # Load a tiny bit of the first config to get columns
-                ds_sample = load_dataset(dataset_id, selected_configs[0], split='all[:1]') # Load 1 example
-                if isinstance(ds_sample, dict): # Handle DatasetDict
-                     first_split_key = next(iter(ds_sample))
-                     available_columns = ds_sample[first_split_key].column_names
-                else: # Handle Dataset
-                     available_columns = ds_sample.column_names
+                first_config = selected_configs[0]
+                config_name_str = first_config if first_config else "default" # For logging
+
+                # Get available splits for the first selected config
+                print(f"Looking for splits in config '{config_name_str}'...")
+                split_names = get_dataset_split_names(dataset_id, configuration=first_config)
+
+                if split_names:
+                    first_split_name = split_names[0]
+                    print(f"Found splits: {split_names}. Attempting to load 1 example from '{first_split_name}' to get columns...")
+                    # Load 1 example from the first available split
+                    # Use trust_remote_code cautiously if needed for specific datasets
+                    ds_sample = load_dataset(dataset_id, first_config, split=f'{first_split_name}[:1]', trust_remote_code=True)
+                    # load_dataset with a specific split returns a Dataset object directly
+                    available_columns = ds_sample.column_names
+                    if not available_columns:
+                         print(f"Warning: Loaded sample from '{first_split_name}' but found no columns.")
+                else:
+                    print(f"Warning: No splits found for config '{config_name_str}'. Cannot automatically determine columns.")
 
             except Exception as e:
-                 print(f"Could not load sample to determine columns: {e}. Please specify columns manually.")
-                 available_columns = []
+                 # Catch errors during split name fetching or sample loading
+                 print(f"Could not automatically determine columns: {e}. Please specify columns manually.")
+                 # available_columns remains empty (triggers manual input below)
 
 
             print("\nAvailable columns:")

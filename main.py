@@ -6,24 +6,29 @@ import json
 import ast
 import time
 import warnings # To warn about issues
+import math # For chunking calculation
 from tqdm import tqdm
 import boto3
 import subprocess
 import argparse
 import yaml
-from datasets import load_dataset, get_dataset_config_names, concatenate_datasets, get_dataset_split_names
+from datasets import load_dataset, get_dataset_config_names, concatenate_datasets, get_dataset_split_names # Added get_dataset_split_names
 from huggingface_hub import login
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import openai
 import tiktoken # Needed for OpenAI token counting
-from typing import Optional, List, Tuple, Any, Dict
+from typing import Optional, List, Tuple, Any, Dict # Added Any, Dict
 
 # --- Constants ---
 AWS_TRANSLATE_MAX_BYTES = 9900 # Slightly less than 10k limit for safety
-OPENAI_DEFAULT_MODEL = "gpt-4o-mini" # User requested model
-OPENAI_MAX_TOKENS = 127000 # Context window for gpt-4o-mini (input+output), use slightly less
-TOKENIZER_NAME = "cl100k_base" # Tokenizer for gpt-4o-mini
+OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
+# Context window for gpt-4o-mini is 128k tokens, leave buffer
+OPENAI_MAX_TOKENS = 127000
+# Tokenizer for gpt-4o-mini and others
+TOKENIZER_NAME = "cl100k_base"
+# Practical character limit per API call for large text chunking
+PRACTICAL_CHAR_LIMIT = 8000
 
 # --- Helper: Tokenizer ---
 try:
@@ -69,128 +74,177 @@ def translate_text_aws(text: str, client: Any, source_lang="en", target_lang="es
     if not text:
         return text
 
-    text_bytes = text.encode('utf-8')
+    try:
+        text_bytes = text.encode('utf-8')
+    except Exception as e:
+         warnings.warn(f"Could not encode text to UTF-8: {e}. Returning original snippet: '{text[:100]}...'")
+         return text
+
     if len(text_bytes) <= AWS_TRANSLATE_MAX_BYTES:
         # Text is within limits, translate directly
         for attempt in range(max_retries):
+            # <<< DEBUG PRINT ADDED >>>
+            # print(f"          [DEBUG][AWS] Attempt {attempt+1}/{max_retries}: Sending request for text (len: {len(text)}): {text[:50]}...")
             try:
                 response = client.translate_text(
                     Text=text,
                     SourceLanguageCode=source_lang,
                     TargetLanguageCode=target_lang
                 )
+                # <<< DEBUG PRINT ADDED >>>
+                # print(f"          [DEBUG][AWS] Received response (Attempt {attempt+1}).")
                 return response["TranslatedText"]
             except Exception as e:
+                # <<< DEBUG PRINT ADDED >>>
+                # print(f"          [DEBUG][AWS] ERROR during call (Attempt {attempt+1}): {e}")
+                warnings.warn(f"AWS Translate API error on attempt {attempt + 1}/{max_retries}: {e}")
                 if attempt == max_retries - 1:
-                    warnings.warn(f"AWS Translate failed after {max_retries} attempts: {e}. Returning original text snippet: '{text[:100]}...'")
+                    warnings.warn(f"AWS Translate failed after {max_retries} attempts. Returning original text snippet: '{text[:100]}...'")
                     return text
-                time.sleep(2 ** attempt) # Exponential backoff
+                 # <<< DEBUG PRINT ADDED >>>
+                # print(f"          [DEBUG][AWS] Retrying after delay...")
+                time.sleep(1.5 ** attempt) # Exponential backoff slightly gentler for AWS
         return text # Should not be reached, but as fallback
     else:
         # Text exceeds limit, split into chunks (simple paragraph/sentence split)
+        # <<< DEBUG PRINT ADDED >>>
+        # print(f"          [DEBUG][AWS] Text exceeds byte limit ({len(text_bytes)} > {AWS_TRANSLATE_MAX_BYTES}). Splitting.")
         warnings.warn(f"Text exceeds AWS byte limit ({len(text_bytes)} > {AWS_TRANSLATE_MAX_BYTES}). Splitting text.")
         translated_chunks = []
         current_chunk = ""
         # Simple split by paragraphs first, then sentences as fallback
+        # Prioritize paragraph breaks for potentially better context joining
         paragraphs = text.split('\n\n')
         sentences_to_process = []
         for p in paragraphs:
             if p.strip():
                  # Further split long paragraphs by sentences (basic split)
-                 sentences_to_process.extend(s + '.' for s in p.split('. ') if s.strip())
+                 sentences_to_process.extend(s.strip() + '.' for s in p.split('. ') if s.strip()) # Add period back
+
+        # <<< DEBUG PRINT ADDED >>>
+        # print(f"          [DEBUG][AWS] Splitting into {len(sentences_to_process)} potential sentences/parts...")
 
         for sentence in sentences_to_process:
             sentence_bytes = sentence.encode('utf-8')
             current_chunk_bytes = current_chunk.encode('utf-8')
 
-            if len(current_chunk_bytes) + len(sentence_bytes) <= AWS_TRANSLATE_MAX_BYTES:
-                current_chunk += sentence
+            if len(current_chunk_bytes) + len(sentence_bytes) + 1 <= AWS_TRANSLATE_MAX_BYTES: # +1 for potential space
+                current_chunk += sentence + " " # Add space between sentences
             else:
                 # Translate the current chunk if it's not empty
                 if current_chunk:
+                    # <<< DEBUG PRINT ADDED >>>
+                    # print(f"            [DEBUG][AWS] Translating chunk (bytes: {len(current_chunk.encode('utf-8'))})...")
                     translated_chunks.append(translate_text_aws(current_chunk.strip(), client, source_lang, target_lang, max_retries))
                 # Start a new chunk with the current sentence
-                # If sentence itself is too long, it will be handled recursively (though inefficiently)
-                current_chunk = sentence
+                # If sentence itself is too long, it will be handled recursively (inefficiently)
+                # <<< DEBUG PRINT ADDED >>>
+                # print(f"            [DEBUG][AWS] Starting new chunk with sentence (bytes: {len(sentence_bytes)})...")
+                current_chunk = sentence + " "
 
         # Translate the last remaining chunk
         if current_chunk:
+            # <<< DEBUG PRINT ADDED >>>
+            # print(f"            [DEBUG][AWS] Translating final chunk (bytes: {len(current_chunk.encode('utf-8'))})...")
             translated_chunks.append(translate_text_aws(current_chunk.strip(), client, source_lang, target_lang, max_retries))
 
-        # Join translated chunks. Decide joiner based on original structure maybe?
-        # Simple space join for now. Could use '\n\n' if paragraphs were dominant.
-        return ' '.join(translated_chunks)
+        # Join translated chunks. Preserve paragraph breaks roughly if possible.
+        # This is heuristic. A better approach would track original separators.
+        # For now, join with space.
+        # <<< DEBUG PRINT ADDED >>>
+        # print(f"          [DEBUG][AWS] Finished splitting. Joining {len(translated_chunks)} translated chunks.")
+        return ' '.join(translated_chunks).strip()
 
 
 def translate_text_openai(text: str, client: Any, source_lang="en", target_lang="es", max_retries=3, model=OPENAI_DEFAULT_MODEL) -> str:
-    """Translates a single text string using OpenAI API, handling token limits."""
+    """Translates a single text string using OpenAI API, handling token limits AND practical size limits."""
     if not text:
         return text
 
-    # Estimate tokens needed for the prompt itself (system + user message)
-    # This is approximate, actual usage depends on model specifics
-    system_prompt = f"You are a professional translator. Translate the following text from {source_lang} to {target_lang}. Preserve formatting, markdown, and special characters. Only return the translated text without explanations."
-    prompt_tokens = count_tokens(system_prompt) + count_tokens(text)
+    # Use character length for simple chunking decision first
+    if len(text) <= PRACTICAL_CHAR_LIMIT:
+        # Text is within practical limits, try direct translation (with token check just in case)
+        system_prompt = f"You are a professional translator. Translate the following text from {source_lang} to {target_lang}. Preserve formatting, markdown, and special characters. Only return the translated text without explanations."
+        prompt_tokens = count_tokens(system_prompt) + count_tokens(text)
 
-    if prompt_tokens <= OPENAI_MAX_TOKENS:
-        # Text likely fits within limit, attempt direct translation
-        for attempt in range(max_retries):
-            try:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": text}
-                    ],
-                    temperature=0.1 # Lower temperature for more deterministic translation
-                )
-                # Check if response is valid
-                if response.choices and response.choices[0].message and response.choices[0].message.content:
-                     return response.choices[0].message.content.strip()
-                else:
-                     raise ValueError("OpenAI response was empty or invalid.")
-
-            except Exception as e:
-                warnings.warn(f"OpenAI API error on attempt {attempt + 1}/{max_retries}: {e}")
-                if attempt == max_retries - 1:
-                    warnings.warn(f"OpenAI Translate failed after {max_retries} attempts. Returning original text snippet: '{text[:100]}...'")
-                    return text
-                time.sleep(2 ** attempt) # Exponential backoff
-        return text # Fallback
+        if prompt_tokens <= OPENAI_MAX_TOKENS:
+            # Fits within model limits too
+            for attempt in range(max_retries):
+                # <<< DEBUG PRINT ADDED >>>
+                # print(f"          [DEBUG] Attempt {attempt+1}/{max_retries}: Sending request to OpenAI for text (len: {len(text)}): {text[:50]}...")
+                try:
+                    # Add a timeout (e.g., 180 seconds for potentially large but under-limit chunks)
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": text}
+                        ],
+                        temperature=0.1,
+                        timeout=180.0
+                    )
+                    # <<< DEBUG PRINT ADDED >>>
+                    # print(f"          [DEBUG] Received response from OpenAI (Attempt {attempt+1}).")
+                    if response.choices and response.choices[0].message and response.choices[0].message.content:
+                        translated_text = response.choices[0].message.content.strip()
+                        # <<< DEBUG PRINT ADDED >>>
+                        # print(f"          [DEBUG] Translation successful: {translated_text[:50]}...")
+                        return translated_text
+                    else:
+                        # <<< DEBUG PRINT ADDED >>>
+                        # print(f"          [DEBUG] ERROR: OpenAI response invalid or empty content (Attempt {attempt+1}).")
+                        raise ValueError("OpenAI response was empty or invalid.")
+                except Exception as e:
+                    # <<< DEBUG PRINT ADDED >>>
+                    # print(f"          [DEBUG] ERROR during OpenAI call (Attempt {attempt+1}): {e}")
+                    warnings.warn(f"OpenAI API error on attempt {attempt + 1}/{max_retries}: {e}")
+                    # Check for timeout explicitly if needed
+                    # if isinstance(e, openai.Timeout):
+                    #    print("          [DEBUG] Request timed out.")
+                    if attempt == max_retries - 1:
+                        warnings.warn(f"OpenAI Translate failed after {max_retries} attempts. Returning original text snippet: '{text[:100]}...'")
+                        return text
+                    # <<< DEBUG PRINT ADDED >>>
+                    # print(f"          [DEBUG] Retrying after delay...")
+                    time.sleep(2 ** attempt) # Exponential backoff
+            # <<< DEBUG PRINT ADDED >>>
+            # print(f"          [DEBUG] Returning original text after all retries failed.")
+            return text # Fallback after retries
+        else:
+             # Input tokens exceed max limit even though chars might be low (rare)
+             # <<< DEBUG PRINT ADDED >>>
+             # print(f"          [DEBUG] ERROR: Text input tokens ({prompt_tokens}) exceed limit ({OPENAI_MAX_TOKENS}). Skipping.")
+             warnings.warn(f"Text input tokens ({prompt_tokens}) exceed limit ({OPENAI_MAX_TOKENS}) despite character count. Skipping translation.")
+             return text # Skip translation if token limit exceeded
 
     else:
-        # Text likely exceeds token limit, split into chunks
-        warnings.warn(f"Text likely exceeds OpenAI token limit ({prompt_tokens} > {OPENAI_MAX_TOKENS}). Splitting text.")
+        # Text exceeds practical char limit, split it first
+        # <<< DEBUG PRINT ADDED >>>
+        # print(f"          [DEBUG] Text exceeds practical limit ({len(text)} > {PRACTICAL_CHAR_LIMIT}). Splitting into chunks.")
+        warnings.warn(f"Text exceeds practical limit ({len(text)} > {PRACTICAL_CHAR_LIMIT}). Splitting text for translation.")
         translated_chunks = []
-        current_chunk = ""
-        # Simple split logic (similar to AWS)
-        paragraphs = text.split('\n\n')
-        sentences_to_process = []
-        for p in paragraphs:
-            if p.strip():
-                 sentences_to_process.extend(s + '.' for s in p.split('. ') if s.strip())
 
-        for sentence in sentences_to_process:
-            # Estimate tokens for potential chunk + sentence
-            chunk_tokens = count_tokens(current_chunk)
-            sentence_tokens = count_tokens(sentence)
-            system_tokens = count_tokens(system_prompt) # Re-estimate system prompt for safety
+        # Simple chunking by character count
+        num_chunks = math.ceil(len(text) / PRACTICAL_CHAR_LIMIT)
+        # <<< DEBUG PRINT ADDED >>>
+        # print(f"          [DEBUG] Splitting into ~{num_chunks} chunks.")
 
-            # Need to leave room for output tokens as well, hard to estimate precisely
-            # Assume output is roughly same length as input for this check
-            if system_tokens + chunk_tokens + sentence_tokens + (chunk_tokens + sentence_tokens) < OPENAI_MAX_TOKENS:
-                current_chunk += sentence
-            else:
-                if current_chunk:
-                    translated_chunks.append(translate_text_openai(current_chunk.strip(), client, source_lang, target_lang, max_retries, model))
-                # If sentence itself is too long, it might fail recursively
-                current_chunk = sentence
+        for i in range(num_chunks):
+            start_index = i * PRACTICAL_CHAR_LIMIT
+            end_index = start_index + PRACTICAL_CHAR_LIMIT
+            text_chunk = text[start_index:end_index]
 
-        if current_chunk:
-            translated_chunks.append(translate_text_openai(current_chunk.strip(), client, source_lang, target_lang, max_retries, model))
+            if text_chunk: # Ensure chunk is not empty
+                # <<< DEBUG PRINT ADDED >>>
+                # print(f"            [DEBUG] Translating chunk {i+1}/{num_chunks} (len: {len(text_chunk)})...")
+                # Recursively call translate_text_openai for the chunk
+                translated_chunk = translate_text_openai(text_chunk, client, source_lang, target_lang, max_retries, model)
+                translated_chunks.append(translated_chunk)
 
-        # Join translated chunks (simple space join)
-        return ' '.join(translated_chunks)
+        # <<< DEBUG PRINT ADDED >>>
+        # print(f"          [DEBUG] Finished splitting. Joining {len(translated_chunks)} translated chunks.")
+        # Join translated chunks - use empty string join
+        return "".join(translated_chunks)
 
 # --- Batch Translation (AWS Optimized) ---
 
@@ -227,14 +281,16 @@ def batch_translate_texts(texts: List[str], client: Any, source_lang="en", targe
         can_batch = True
         if not current_batch_texts:
             can_batch = False
-        # Individual text length check (heuristic, 1000 chars)
-        if any(len(t) > 1000 for t in current_batch_texts):
+        # Individual text length heuristic (chars)
+        if any(len(t) > 1500 for t in current_batch_texts): # Reduced limit for batching
              can_batch = False
         # Combined byte check
         if total_bytes + delimiter_bytes > AWS_TRANSLATE_MAX_BYTES:
              can_batch = False
 
         if can_batch:
+            # <<< DEBUG PRINT ADDED >>>
+            # print(f"    [DEBUG][AWS Batch] Attempting to batch translate {len(current_batch_texts)} texts...")
             combined_text = delimiter.join(current_batch_texts)
             translated_combined = translate_text_aws(combined_text, client, source_lang, target_lang, max_retries)
 
@@ -244,46 +300,70 @@ def batch_translate_texts(texts: List[str], client: Any, source_lang="en", targe
                 if len(translated_texts) == len(current_batch_texts):
                     for j, idx in enumerate(batch_indices):
                         results[idx] = translated_texts[j].strip()
+                    # <<< DEBUG PRINT ADDED >>>
+                    # print(f"    [DEBUG][AWS Batch] Batch successful.")
                     continue # Go to next batch
                 else:
-                    warnings.warn(f"Batch translation split mismatch (expected {len(current_batch_texts)}, got {len(translated_texts)}). Falling back to individual translation for this batch.")
+                    warnings.warn(f"AWS Batch translation split mismatch (expected {len(current_batch_texts)}, got {len(translated_texts)}). Falling back.")
             else:
-                 warnings.warn(f"Batch translation failed or delimiter missing. Falling back to individual translation for this batch.")
+                 warnings.warn(f"AWS Batch translation failed or delimiter missing. Falling back.")
 
         # Fallback: Translate individually if batching failed or wasn't attempted
+        # <<< DEBUG PRINT ADDED >>>
+        # print(f"    [DEBUG][AWS Batch] Using individual translation for {len(batch_indices)} texts in this batch.")
         for idx in batch_indices:
              results[idx] = translate_text_aws(texts[idx], client, source_lang, target_lang, max_retries)
 
     return results
 
-
 # --- Special Format Handling ---
 
 def translate_python_literal_conversation(conv_str: str, client: Any, max_retries=3, provider="aws", openai_model=OPENAI_DEFAULT_MODEL) -> str:
     """Translates 'value' fields within a Python literal list-of-dicts conversation."""
+    # <<< DEBUG PRINT ADDED >>>
+    # print(f"      [DEBUG] Attempting to parse conversation literal: {conv_str[:100]}...")
+    if not isinstance(conv_str, str): # Handle potential non-string input if data is malformed
+        warnings.warn(f"Non-string input to translate_python_literal_conversation: {type(conv_str)}. Returning as is.")
+        return conv_str # Or str(conv_str) if preferred
+
     try:
         # Safely parse the string as a Python literal
         conversations = ast.literal_eval(conv_str)
         if not isinstance(conversations, list):
              raise ValueError("Parsed conversation is not a list.")
+        # <<< DEBUG PRINT ADDED >>>
+        # print(f"      [DEBUG] Parsed successfully. Num entries: {len(conversations)}")
 
         translated = False
-        for entry in conversations:
+        # <<< DEBUG PRINT ADDED >>>
+        # print(f"      [DEBUG] Starting loop through conversation entries...")
+        for i, entry in enumerate(conversations):
             # Check if entry is a dict and has 'value' field with content
             if isinstance(entry, dict) and 'value' in entry and entry['value'] and isinstance(entry['value'], str):
                 original_value = entry['value']
+                # <<< DEBUG PRINT ADDED >>>
+                # print(f"        [DEBUG] Translating value for entry {i} (len: {len(original_value)}): {original_value[:50]}...")
+                # Call the main translate_text function
                 entry['value'] = translate_text(original_value, client, max_retries=max_retries, provider=provider, openai_model=openai_model)
+                # <<< DEBUG PRINT ADDED >>>
+                # print(f"        [DEBUG] Finished translating value for entry {i}.")
                 if entry['value'] != original_value:
                      translated = True
 
+        # <<< DEBUG PRINT ADDED >>>
+        # print(f"      [DEBUG] Finished loop. Returning {'modified' if translated else 'original'} conversation string.")
         # Return modified structure as Python literal string if translation occurred
         # Otherwise return original to avoid format changes if nothing translated
         return str(conversations) if translated else conv_str
 
     except (ValueError, SyntaxError, TypeError) as e:
+        # <<< DEBUG PRINT ADDED >>>
+        # print(f"      [DEBUG] ERROR during parsing: {e}")
         warnings.warn(f"Could not parse/process conversation literal: {e}. Returning original string: '{conv_str[:100]}...'")
         return conv_str
     except Exception as e:
+         # <<< DEBUG PRINT ADDED >>>
+         # print(f"      [DEBUG] UNEXPECTED ERROR during processing: {e}")
          warnings.warn(f"Unexpected error processing conversation literal: {e}. Returning original: '{conv_str[:100]}...'")
          return conv_str
 
@@ -307,22 +387,29 @@ def translate_batch(
     Translates a batch of texts for selected columns using various strategies.
     Modifies the batch dictionary in-place (as expected by .map).
     """
+    # <<< DEBUG PRINT ADDED >>>
+    # print(f"  [DEBUG] translate_batch called for {len(batch[selected_cols[0]]) if selected_cols else 0} rows.")
     for col in selected_cols:
         if col in batch:
+            # <<< DEBUG PRINT ADDED >>>
+            # print(f"    Processing column: {col}")
             texts_to_process = batch[col]
             results = [None] * len(texts_to_process) # Placeholder for results
 
             # --- Handle System Prompts (Caching) ---
             if col == "system" and translation_cache is not None and len(texts_to_process) > 0:
-                # Check if all prompts in this batch are identical
+                # <<< DEBUG PRINT ADDED >>>
+                # print(f"      -> Checking for system prompt cache...")
                 first_prompt = str(texts_to_process[0]) if texts_to_process[0] is not None else ""
-                all_same = all((str(txt) if txt is not None else "") == first_prompt for txt in texts_to_process)
+                # Check if first prompt is valid and if all others are identical
+                all_same = False
+                if first_prompt:
+                    all_same = all((str(txt) if txt is not None else "") == first_prompt for txt in texts_to_process)
 
-                if all_same and first_prompt:
+                if all_same: # Handles case where first_prompt is "" correctly
                     cache_key = f"{provider}:{first_prompt}"
                     if cache_key in translation_cache:
                         translated = translation_cache[cache_key]
-                        # print(f"Using CACHED translation for system prompt (hash: {hash(first_prompt) % 10000})") # Optional: verbose logging
                     else:
                         # print(f"Translating NEW system prompt (hash: {hash(first_prompt) % 10000})") # Optional: verbose logging
                         translated = translate_text(first_prompt, client, max_retries=max_retries, provider=provider, openai_model=openai_model)
@@ -330,14 +417,21 @@ def translate_batch(
                     results = [translated] * len(texts_to_process)
                     batch[col] = results
                     continue # Skip other processing for this column
+                else:
+                     # Fall through to regular processing if prompts in batch differ
+                     # <<< DEBUG PRINT ADDED >>>
+                     # print(f"      -> System prompts in batch differ, processing individually...")
+                     pass
+
 
             # --- Handle Conversation Column ---
             # Handles 'conversation' (singular) and 'conversations' (plural)
             if col in ["conversation", "conversations"]:
-                # Process each conversation string individually
-                # Parallelization can be applied here
+                # <<< DEBUG PRINT ADDED >>>
+                # print(f"      -> Processing as conversation column...")
                 def process_conv(conv_str):
-                     return translate_python_literal_conversation(str(conv_str) if conv_str else "", client, max_retries, provider, openai_model)
+                     # Ensure input is string, handle None or other types gracefully
+                     return translate_python_literal_conversation(str(conv_str) if conv_str is not None else "", client, max_retries, provider, openai_model)
 
                 if use_parallel and len(texts_to_process) > 1:
                     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -348,9 +442,11 @@ def translate_batch(
                 continue # Skip other processing for this column
 
             # --- Handle Regular Text Columns ---
-            # Filter out None values before translation
+            # <<< DEBUG PRINT ADDED >>>
+            # print(f"      -> Processing as regular text column...")
+            # Filter out None values before translation, keep track of original indices
             valid_indices = [i for i, txt in enumerate(texts_to_process) if txt is not None and isinstance(txt, str)]
-            valid_texts = [str(texts_to_process[i]) for i in valid_indices]
+            valid_texts = [str(texts_to_process[i]) for i in valid_indices] # Ensure string type
             translated_texts = [None] * len(valid_texts) # Results for valid texts
 
             if not valid_texts: # No valid text to translate in this column batch
@@ -359,10 +455,8 @@ def translate_batch(
 
             # Choose translation strategy
             if use_batching and provider == "aws" and len(valid_texts) > 1:
-                # Use AWS-specific batching function
-                translated_texts = batch_translate_texts(valid_texts, client, max_retries=max_retries, batch_size=batch_size, provider=provider)
+                translated_texts = batch_translate_texts(valid_texts, client, source_lang="en", target_lang="es", max_retries=max_retries, batch_size=batch_size, provider=provider)
             elif use_parallel and len(valid_texts) > 1:
-                # Parallel individual translation
                 with ThreadPoolExecutor(max_workers=workers) as executor:
                      future_to_idx = {
                           executor.submit(translate_text, text, client, "en", "es", max_retries, provider, openai_model): i
@@ -373,15 +467,15 @@ def translate_batch(
                           try:
                               translated_texts[idx] = future.result()
                           except Exception as e:
-                              warnings.warn(f"Error translating text in parallel: {e}. Keeping original.")
+                              warnings.warn(f"Error translating text in parallel for column '{col}': {e}. Keeping original.")
                               translated_texts[idx] = valid_texts[idx] # Keep original on error
             else:
                 # Sequential individual translation
                 for i, text in enumerate(valid_texts):
                      translated_texts[i] = translate_text(text, client, "en", "es", max_retries, provider, openai_model)
 
-            # Place translated results back into the original batch structure, keeping None values
-            final_results = list(texts_to_process) # Start with original
+            # Place translated results back into the original batch structure, preserving None/non-string values
+            final_results = list(texts_to_process) # Start with original batch content
             for i, original_idx in enumerate(valid_indices):
                  final_results[original_idx] = translated_texts[i]
             batch[col] = final_results
@@ -421,7 +515,7 @@ def load_progress(work_dir):
             with open(progress_file, 'r') as f:
                 return json.load(f)
         except Exception as e:
-            warnings.warn(f"Error loading progress file {progress_file}: {e}")
+            warnings.warn(f"Error loading progress file {progress_file}: {e}. Starting fresh.")
             return None
     return None
 
@@ -429,34 +523,61 @@ def load_progress(work_dir):
 
 def get_full_repo_url(repo_name):
     """Convert repo name to full Hugging Face URL"""
-    if not '/' in repo_name:
+    if '/' not in repo_name:
          warnings.warn("Repository name should be in format 'username/repo_name'. Assuming username is part of the name.")
-    return f"https://huggingface.co/datasets/{repo_name}"
+    # Ensure it points to datasets
+    if not repo_name.startswith("datasets/"):
+         if repo_name.count('/') == 1:
+              return f"https://huggingface.co/datasets/{repo_name}"
+         else: # Handle cases where user might include 'datasets/' already or have multiple slashes
+              parts = [p for p in repo_name.split('/') if p]
+              if len(parts) >= 2:
+                   return f"https://huggingface.co/datasets/{'/'.join(parts[-2:])}"
+              else: # Fallback if format is very unexpected
+                   return f"https://huggingface.co/datasets/{repo_name}"
+    else: # Already includes 'datasets/' prefix - use as is but construct URL
+         return f"https://huggingface.co/{repo_name}"
+
 
 def prepare_repository(repo_dir, repo_name, token=None):
     """Set up git repository with proper LFS handling"""
     os.makedirs(repo_dir, exist_ok=True)
     try:
         print("Setting up git LFS...")
-        subprocess.run(['git', 'lfs', 'install', '--system', '--skip-repo'], check=True, capture_output=True)
+        # Run globally first to ensure LFS filters are installed system-wide if possible
+        try:
+            subprocess.run(['git', 'lfs', 'install', '--system', '--skip-repo'], check=True, capture_output=True)
+        except Exception as e_lfs_global:
+             print(f"Info: Could not run 'git lfs install --system' (may require admin rights): {e_lfs_global}. Proceeding with local repo install.")
+             subprocess.run(['git', 'lfs', 'install', '--local'], check=True, capture_output=True)
+
 
         repo_url = get_full_repo_url(repo_name)
-        print(f"Cloning or initializing repository: {repo_url}")
+        print(f"Cloning or initializing repository: {repo_name} from {repo_url}")
 
         # Try cloning, if fails, init new repo
         try:
-            subprocess.run(['git', 'clone', repo_url, repo_dir], check=True, capture_output=True)
+            # Clone with specific depth or filter later if needed for large repos
+            subprocess.run(['git', 'clone', repo_url, repo_dir], check=True, stderr=subprocess.PIPE) # Show stderr on error
             print("Repository cloned.")
             # Ensure LFS is tracked even in existing repo
-            subprocess.run(['git', 'lfs', 'track', "*.parquet"], cwd=repo_dir, check=True, capture_output=True)
-            subprocess.run(['git', 'add', '.gitattributes'], cwd=repo_dir, capture_output=True) # Add if changed
-            subprocess.run(['git', 'commit', '-m', 'Ensure LFS tracking for parquet'], cwd=repo_dir, capture_output=True) # Commit if changed
-        except subprocess.CalledProcessError:
-            print("Clone failed (repo might not exist or empty). Initializing new repository.")
+            subprocess.run(['git', 'lfs', 'track', "data/**/*.parquet"], cwd=repo_dir, check=True, capture_output=True) # Track parquet files in data/ subdir
+            subprocess.run(['git', 'add', '.gitattributes'], cwd=repo_dir, capture_output=True) # Add if changed/created
+            # Check if commit needed
+            status_result = subprocess.run(['git', 'status', '--porcelain', '.gitattributes'], cwd=repo_dir, check=True, capture_output=True, text=True)
+            if status_result.stdout:
+                 subprocess.run(['git', 'commit', '-m', 'Ensure LFS tracking for parquet files'], cwd=repo_dir, capture_output=True)
+                 print("Committed .gitattributes LFS tracking.")
+
+        except subprocess.CalledProcessError as e_clone:
+            print(f"Clone failed (repo might not exist, be empty, or access denied): {e_clone.stderr.decode() if e_clone.stderr else e_clone}")
+            print("Initializing new repository.")
             subprocess.run(['git', 'init'], cwd=repo_dir, check=True, capture_output=True)
             # Setup LFS tracking
-            subprocess.run(['git', 'lfs', 'track', "*.parquet"], cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(['git', 'lfs', 'track', "data/**/*.parquet"], cwd=repo_dir, check=True, capture_output=True)
             subprocess.run(['git', 'add', '.gitattributes'], cwd=repo_dir, check=True, capture_output=True) # Add .gitattributes
+            # Commit .gitattributes *before* adding remote if git complains
+            subprocess.run(['git', 'commit', '-m', 'Initial commit with LFS tracking'], cwd=repo_dir, check=True, capture_output=True)
             # Setup remote
             subprocess.run(['git', 'remote', 'add', 'origin', repo_url], cwd=repo_dir, check=True, capture_output=True)
             # Setup dummy user for commits if needed (will use global config if not set here)
@@ -467,30 +588,33 @@ def prepare_repository(repo_dir, repo_name, token=None):
         return True
     except subprocess.CalledProcessError as e:
         print(f"Error setting up repository: {e}")
+        print(f"Command: '{e.cmd}'")
         print(f"Stderr: {e.stderr.decode() if e.stderr else 'N/A'}")
         return False
     except FileNotFoundError:
          print("Error: 'git' or 'git-lfs' command not found. Please install them and ensure they are in your PATH.")
          return False
+    except Exception as e_setup:
+         print(f"An unexpected error occurred during repository setup: {e_setup}")
+         return False
 
 
-def create_readme_and_yaml(work_dir, selected_configs, dataset_id, provider="aws", openai_model=None):
-    """Creates README.md and dataset.yaml files with dataset information"""
+def create_readme_and_yaml(work_dir, selected_configs, dataset_id, provider, openai_model, repo_name): # Added repo_name
+    """Creates README.md and dataset_infos.yaml files with dataset information"""
     # Generate dataset_info.yaml content
     dataset_yaml_content = {"configs": []}
-    has_default_config = False
 
     for cfg in selected_configs:
         cfg_name = cfg if cfg else "default"
-        if cfg_name == "default":
-            has_default_config = True
 
-        config_dir_rel = os.path.join("data", cfg_name) # HF standard path is data/<config_name>
-        config_dir_abs = os.path.join(work_dir, config_dir_rel)
+        # Path structure expected by HF datasets: data/<config_name>/<split>.parquet
+        config_data_dir_rel = os.path.join("data", cfg_name)
+        config_data_dir_abs = os.path.join(work_dir, config_data_dir_rel)
 
         splits = []
-        if os.path.exists(config_dir_abs):
-            for file in os.listdir(config_dir_abs):
+        if os.path.exists(config_data_dir_abs):
+            for file in os.listdir(config_data_dir_abs):
+                # Look for final parquet files, ignore chunk files
                 if file.endswith(".parquet") and not file.startswith("chunk_"):
                     splits.append(file.replace(".parquet", ""))
 
@@ -502,17 +626,18 @@ def create_readme_and_yaml(work_dir, selected_configs, dataset_id, provider="aws
             for split in sorted(splits): # Sort splits for consistency
                 config_entry["data_files"].append({
                     "split": split,
-                    "path": f"{config_dir_rel}/{split}.parquet"
+                    # Use relative path for YAML
+                    "path": f"{config_data_dir_rel}/{split}.parquet"
                 })
             dataset_yaml_content["configs"].append(config_entry)
 
     # Serialize YAML content
     try:
-         # Use safe_dump and allow unicode
+         # Use safe_dump and allow unicode, ensure flow style is block
          dataset_yaml_str = yaml.safe_dump(dataset_yaml_content, allow_unicode=True, default_flow_style=False, sort_keys=False).strip()
     except Exception as e:
          warnings.warn(f"Could not serialize dataset info to YAML: {e}")
-         dataset_yaml_str = "# Error generating YAML"
+         dataset_yaml_str = "# Error generating YAML content"
 
 
     # README Content
@@ -520,16 +645,18 @@ def create_readme_and_yaml(work_dir, selected_configs, dataset_id, provider="aws
     if provider == "openai":
         translation_method = f"OpenAI API (Model: {openai_model or OPENAI_DEFAULT_MODEL})"
 
+    # Use the passed repo_name in the example usage
     readme_content = f"""---
-# Basic card metadata
-license: mit # License for the *translation script*, data license depends on original source
+# Basic card metadata generated by traductor-datasets script
+# Consider adding more specific metadata based on the dataset's nature
+license: unknown # License of translated data depends on original source and translation TOS
 language:
-- en # Original language
+- en # Original language assumed
 - es # Translated language
-# Add other relevant tags
 tags:
 - translation
 - parallel-corpus
+- machine-translated
 ---
 
 # Spanish Translation of {dataset_id}
@@ -540,32 +667,39 @@ The translation was performed using the `traductor-datasets` tool.
 
 **Translation Method**: {translation_method}
 
-**Original Dataset Structure**: The original dataset structure (configs and splits) has been preserved.
+**Original Dataset Structure**: The original dataset structure (configs and splits) has been preserved in the `data/` directory.
 
-**Note**: These translations were generated automatically and may contain errors or artifacts typical of machine translation. They are provided as-is. Please refer to the original dataset for authoritative content.
+**Note**: These translations were generated automatically and may contain errors or artifacts typical of machine translation. They are provided as-is without warranty. Please refer to the original dataset for authoritative content. Use of this translated data may be subject to the license of the original dataset and the terms of service of the translation provider ({provider}).
 
 ## Loading the Dataset
 
 ```python
 from datasets import load_dataset
 
-# Load a specific config and split (e.g., 'default' config, 'train' split)
-ds = load_dataset("your_hf_username/{repo_name}", name="default", split="train")
+# Example: Load the 'default' config, 'train' split
+# Replace '{repo_name}' with the actual repository path if different
+# Replace 'default' and 'train' with desired config/split if needed
+ds = load_dataset("{repo_name}", name="default", split="train")
 
-# Load the default config (all splits)
-ds_dict = load_dataset("your_hf_username/{repo_name}", name="default")
+# Example: Load all splits for the 'default' config
+ds_dict = load_dataset("{repo_name}", name="default")
+
+print(ds)
+# print(ds_dict)
 ```
 
-Replace `your_hf_username/{repo_name}` with the actual repository path, and adjust `name` and `split` as needed based on the available configs/splits.
+Replace `{repo_name}` with the actual repository path (e.g., `amias-mx/OpenThoughts-114k-spanish`), and adjust `name` and `split` as needed based on the available configs/splits defined in `dataset_infos.yaml`.
 """
 
     # Write files
     try:
-        with open(os.path.join(work_dir, "README.md"), "w", encoding='utf-8') as f:
+        readme_path = os.path.join(work_dir, "README.md")
+        yaml_path = os.path.join(work_dir, "dataset_infos.yaml") # Standard filename
+        with open(readme_path, "w", encoding='utf-8') as f:
             f.write(readme_content)
-        # Save as dataset_infos.yaml which is sometimes preferred by HF tools
-        with open(os.path.join(work_dir, "dataset_infos.yaml"), "w", encoding='utf-8') as f:
+        with open(yaml_path, "w", encoding='utf-8') as f:
             f.write(dataset_yaml_str)
+        print(f"Generated {os.path.basename(readme_path)} and {os.path.basename(yaml_path)}")
     except Exception as e:
          warnings.warn(f"Error writing metadata files: {e}")
 
@@ -574,26 +708,30 @@ Replace `your_hf_username/{repo_name}` with the actual repository path, and adju
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Translate HuggingFace datasets with incremental saving and upload.')
-    parser.add_argument('--test', action='store_true', help='Test mode: process only a small number of rows per split (e.g., 10)')
-    parser.add_argument('--retries', type=int, default=3, help='Number of retries for translation API calls')
+    # Execution Control
+    parser.add_argument('--test', action='store_true', help='Test mode: process only ~10 rows per split')
     parser.add_argument('--resume', action='store_true', help='Resume from a previous run (requires work directory path)')
-    parser.add_argument('--chunk-size', type=int, default=100, help='Number of examples to process before saving progress')
-    parser.add_argument('--parallel', action='store_true', help='Use parallel processing (ThreadPoolExecutor) for translation calls')
-    parser.add_argument('--workers', type=int, default=10, help='Number of worker threads for parallel processing')
+    # Dataset/Columns Specification (Optional, interactive otherwise)
+    parser.add_argument('--dataset', help='HuggingFace dataset ID (e.g., username/dataset_name)')
+    parser.add_argument('--columns', help='Comma-separated column names to translate (if skipping interactive selection)')
+    parser.add_argument('--target-repo', help='Target HuggingFace repo name (e.g., username/repo-name-es)')
+    # Translation Parameters
+    parser.add_argument('--provider', choices=['aws', 'openai'], default='aws', help='Translation provider (default: aws)')
+    parser.add_argument('--openai-model', default=OPENAI_DEFAULT_MODEL, help=f'OpenAI model (default: {OPENAI_DEFAULT_MODEL})')
+    parser.add_argument('--retries', type=int, default=3, help='Max retries for translation API calls (default: 3)')
+    # Performance/Process Parameters
+    parser.add_argument('--chunk-size', type=int, default=100, help='Examples per chunk before saving progress (default: 100)')
+    parser.add_argument('--parallel', action='store_true', help='Use parallel processing (ThreadPoolExecutor)')
+    parser.add_argument('--workers', type=int, default=10, help='Number of worker threads for parallel processing (default: 10)')
     parser.add_argument('--batch', action='store_true', help='Use batch translation for AWS (groups multiple short texts)')
-    parser.add_argument('--batch-size', type=int, default=5, help='Number of texts to combine in AWS batch translation')
-    # Defaulting global cache to True as it's generally beneficial for system prompts
-    # Use --no-global-cache to disable it if needed (requires adding the action='store_false' argument)
-    # parser.add_argument('--no-global-cache', dest='use_global_cache', action='store_false', help='Disable global caching of identical content')
-    # parser.set_defaults(use_global_cache=True)
-    # Simple flag for now:
-    parser.add_argument('--global-cache', action='store_true', default=True, help='Enable global caching (default: True)')
-    parser.add_argument('--provider', choices=['aws', 'openai'], default='aws', help='Translation provider to use (default: aws)')
-    parser.add_argument('--openai-model', default=OPENAI_DEFAULT_MODEL, help=f'OpenAI model to use (default: {OPENAI_DEFAULT_MODEL})')
+    parser.add_argument('--batch-size', type=int, default=5, help='Number of texts per AWS batch (default: 5)')
+    parser.add_argument('--global-cache', action='store_true', default=True, help='Enable global caching for identical texts (default: True)')
+    # Add option to disable cache if needed
+    # parser.add_argument('--no-global-cache', dest='use_global_cache', action='store_false', help='Disable global caching')
+    # parser.set_defaults(use_global_cache=True) # Keep default True behavior for now
 
     args = parser.parse_args()
-    use_global_cache = args.global_cache # Assign based on parsed args
-
+    use_global_cache = args.global_cache
 
     # --- Setup Work Directory ---
     work_dir = None
@@ -634,21 +772,26 @@ def main():
             provider = progress.get('provider', args.provider)
             openai_model = progress.get('openai_model', args.openai_model)
             print(f"  Provider: {provider}")
-            if provider == 'openai':
-                print(f"  OpenAI Model: {openai_model}")
+            if provider == 'openai': print(f"  OpenAI Model: {openai_model}")
             print(f"  Config: {progress.get('config', 'N/A')}")
             print(f"  Split: {progress.get('split', 'N/A')}")
             print(f"  Resuming from example row: {progress.get('current_row', 0)}")
             print(f"  Columns being translated: {progress.get('selected_cols', 'N/A')}")
+            # Load other necessary info if resuming
+            dataset_id = progress.get('dataset_id')
+            selected_configs = progress.get('configs')
+            selected_cols = progress.get('selected_cols')
+            # Target repo is not saved in progress, will need to ask again or use arg
         else:
             print("Warning: Could not load progress file. Starting fresh setup.")
             args.resume = False # Force fresh setup
 
     # --- Initialize Translation Client ---
     client = None
+    print(f"\nInitializing translation client for provider: {provider}")
     if provider == "openai":
         openai_api_key = os.environ.get("OPENAI_API_KEY")
-        if not openai_api_key and not args.resume: # Only ask if not resuming and not set
+        if not openai_api_key and not args.resume: # Only ask if new run and not set
             openai_api_key = input("Enter OpenAI API key: ").strip()
 
         if openai_api_key:
@@ -656,28 +799,34 @@ def main():
                 client = create_openai_client(openai_api_key)
                 print(f"OpenAI client initialized (Model: {openai_model})")
             except Exception as e:
-                print(f"Error initializing OpenAI client: {e}. Check API key and connectivity.")
-                return # Cannot proceed without client
+                print(f"Error initializing OpenAI client: {e}. Check API key/connectivity.")
+                return
         else:
-             print("Error: OpenAI provider selected, but no API key found (checked OPENAI_API_KEY env var).")
+             print("Error: OpenAI provider selected, but no API key found or provided.")
              return
     else: # AWS
         try:
-            # Region can be configured via env vars (AWS_DEFAULT_REGION) or ~/.aws/config
             client = create_aws_translate_client()
             print("AWS Translate client initialized.")
         except Exception as e:
-            print(f"Error initializing AWS Translate client: {e}. Check credentials and region configuration.")
+            print(f"Error initializing AWS Translate client: {e}. Check credentials/region.")
             return
 
-    # --- Get Dataset Info (if not resuming) ---
+    # --- Get Dataset, Configs, Columns (if not resuming) ---
     if not args.resume:
-        dataset_id = input("Enter Hugging Face dataset ID (e.g., username/dataset_name): ").strip()
+        # 1. Get Dataset ID
+        dataset_id = None
+        if args.dataset:
+            dataset_id = args.dataset.strip()
+            print(f"\nUsing dataset ID from command line: {dataset_id}")
+        else:
+            dataset_id = input("\nEnter Hugging Face dataset ID (e.g., username/dataset_name): ").strip()
         if not dataset_id: print("Dataset ID required."); return
 
+        # 2. Get Configs
         try:
             print("\nFetching dataset configurations...")
-            available_configs = get_dataset_config_names(dataset_id)
+            available_configs = get_dataset_config_names(dataset_id, trust_remote_code=True)
             if not available_configs:
                 print("No named configs found, assuming default config.")
                 available_configs = [None] # Use None for default
@@ -700,91 +849,101 @@ def main():
                     indices = [int(i.strip()) for i in selected_configs_input.split(',')]
                     selected_configs = [available_configs[i] for i in indices if 0 <= i < len(available_configs)]
                 except ValueError:
-                    print("Invalid config number format.")
-                    return
+                    print("Invalid config number format."); return
             if not selected_configs: print("No valid configs selected."); return
             print(f"\nSelected configs: {[cfg if cfg else 'default' for cfg in selected_configs]}")
 
+        except Exception as e:
+            print(f"Error fetching configs: {e}. Assuming default config.")
+            selected_configs = [None]
 
-            # Get columns from the first selected config/split
-            print("\nFetching column names...")
-            available_columns = [] # Initialize as empty
+        # 3. Get Columns
+        print("\nAttempting to fetch column names...")
+        available_columns = []
+        selected_cols = []
+
+        if args.columns:
+           selected_cols = [c.strip() for c in args.columns.split(',') if c.strip()]
+           print(f"Using columns from command line: {selected_cols}")
+           if not selected_cols: print("Error: --columns specified but empty."); return
+           # Skip auto-detection if columns are specified via args
+        else:
+            # --columns not provided, attempt auto-detection
             try:
                 first_config = selected_configs[0]
-                config_name_str = first_config if first_config else "default" # For logging
-
-                # Get available splits for the first selected config
+                config_name_str = first_config if first_config else "default"
                 print(f"Looking for splits in config '{config_name_str}'...")
-                split_names = get_dataset_split_names(dataset_id, configuration=first_config)
+
+                # Try getting splits first using config name string or None
+                split_names = get_dataset_split_names(dataset_id, config_name_str if config_name_str != 'default' else None)
+
+                if not split_names: # If that fails, try loading dataset object
+                     print("Couldn't get splits directly, trying loading dataset object...")
+                     ds_splits = load_dataset(dataset_id, first_config, download_mode='reuse_cache_if_exists', trust_remote_code=True)
+                     if isinstance(ds_splits, dict):
+                          split_names = list(ds_splits.keys())
+                     else: # Maybe it's a single split Dataset object?
+                          split_names = [ds_splits.split] if hasattr(ds_splits, 'split') and ds_splits.split else ['train'] # Guess 'train' as fallback
+
 
                 if split_names:
                     first_split_name = split_names[0]
-                    print(f"Found splits: {split_names}. Attempting to load 1 example from '{first_split_name}' to get columns...")
-                    # Load 1 example from the first available split
-                    # Use trust_remote_code cautiously if needed for specific datasets
+                    print(f"Found splits: {split_names}. Loading 1 example from '{first_split_name}'...")
                     ds_sample = load_dataset(dataset_id, first_config, split=f'{first_split_name}[:1]', trust_remote_code=True)
-                    # load_dataset with a specific split returns a Dataset object directly
                     available_columns = ds_sample.column_names
-                    if not available_columns:
-                         print(f"Warning: Loaded sample from '{first_split_name}' but found no columns.")
+                    if not available_columns: print(f"Warning: Loaded sample from '{first_split_name}' but found no columns.")
                 else:
-                    print(f"Warning: No splits found for config '{config_name_str}'. Cannot automatically determine columns.")
+                    print(f"Warning: No splits found for config '{config_name_str}'. Cannot determine columns.")
 
             except Exception as e:
-                 # Catch errors during split name fetching or sample loading
                  print(f"Could not automatically determine columns: {e}. Please specify columns manually.")
-                 # available_columns remains empty (triggers manual input below)
+                 available_columns = [] # Ensure it's empty to trigger manual
 
-
-            print("\nAvailable columns:")
+            # Now prompt user based on auto-detection results (only if --columns wasn't used)
             if available_columns:
-                for i, col in enumerate(available_columns):
-                    print(f"  [{i}] {col}")
+                print("\nAvailable columns:")
+                for i, col in enumerate(available_columns): print(f"  [{i}] {col}")
                 cols_input = input("Enter column numbers to translate (comma-separated) or 'all': ").strip()
-
-                selected_cols = []
-                if cols_input.lower() == 'all':
-                    selected_cols = available_columns
+                if cols_input.lower() == 'all': selected_cols = available_columns
                 else:
                     try:
                         indices = [int(i.strip()) for i in cols_input.split(',')]
                         selected_cols = [available_columns[i] for i in indices if 0 <= i < len(available_columns)]
-                    except ValueError:
-                        print("Invalid column number format.")
-                        return
-            else: # Could not auto-detect columns
+                    except ValueError: print("Invalid column number format."); return
+            else: # Auto-detection failed AND --columns not provided
+                 print("\nCould not automatically detect columns and --columns not specified.")
                  cols_input_manual = input("Enter column names to translate (comma-separated): ").strip()
                  if not cols_input_manual: print("Column names required."); return
                  selected_cols = [c.strip() for c in cols_input_manual.split(',')]
 
+        # Final check and confirmation of selected columns
+        if not selected_cols: print("No valid columns selected for translation."); return
+        print(f"\nSelected columns for translation: {selected_cols}")
 
-            if not selected_cols: print("No valid columns selected."); return
-            print(f"\nSelected columns for translation: {selected_cols}")
+        # Save initial state before starting loops
+        save_progress(work_dir, selected_configs[0], None, 0, selected_cols, dataset_id, selected_configs, provider, openai_model)
 
-            # Save initial state before starting loops
-            save_progress(work_dir, selected_configs[0], None, 0, selected_cols, dataset_id, selected_configs, provider, openai_model)
 
-        except Exception as e:
-            print(f"Error during dataset setup: {e}")
-            return
-    else: # Resuming
-        dataset_id = progress.get('dataset_id')
-        selected_configs = progress.get('configs')
-        selected_cols = progress.get('selected_cols')
-        if not all([dataset_id, selected_configs, selected_cols]):
-             print("Error: Could not load necessary info from progress file.")
-             return
+    # --- Get Target Repo Name ---
+    repo_name = None
+    if args.target_repo:
+        repo_name = args.target_repo.strip()
+        print(f"\nUsing target repository from command line: {repo_name}")
+    else:
+        repo_name_prompt = f"\nEnter HF repo name to upload translated dataset (e.g., your_username/{dataset_id.split('/')[-1]}-es): "
+        repo_name = input(repo_name_prompt).strip()
 
-    # --- Get Hugging Face Repo Info ---
-    repo_name = input(f"Enter HF repo name to upload translated dataset (e.g., your_username/{dataset_id}-es): ").strip()
     if not repo_name or '/' not in repo_name:
         print("Invalid repository name format (should be 'username/repo_name').")
         return
-    token = input("Enter HF token with write access (or press Enter if logged in via CLI): ").strip() or None
 
+    # --- Get HF Token (only if not resuming, as it's not saved) ---
+    token = None
+    if not args.resume:
+        token = input("Enter HF token with write access (or press Enter if logged in via CLI): ").strip() or None
 
     # --- Setup Translation Environment ---
-    repo_dir = os.path.join(work_dir, "hf_repo") # Place repo inside work_dir
+    repo_dir = os.path.join(work_dir, "hf_repo") # Place repo clone inside work_dir
     translation_cache = {} if use_global_cache else None
     chunk_size = 5 if args.test else args.chunk_size # Smaller chunk for testing
     print(f"\nUsing chunk size: {chunk_size} examples per save.")
@@ -796,11 +955,37 @@ def main():
     print("\nStarting translation process...")
     try:
         start_config_idx = 0
+        start_split_idx = 0
+        start_row = 0
+        # Determine starting point from progress file if resuming
         if args.resume and progress:
             try:
+                # Find starting config index
                 start_config_idx = selected_configs.index(progress.get('config'))
+                # Find starting split index (only if config matches)
+                if progress.get('split'):
+                     # Need to get splits for the target config to find index
+                     config_to_resume = progress.get('config')
+                     ds_splits_resume = load_dataset(dataset_id, config_to_resume, download_mode='reuse_cache_if_exists', trust_remote_code=True)
+                     split_names_resume = list(ds_splits_resume.keys()) if isinstance(ds_splits_resume, dict) else ['train'] # Adjust if needed
+                     try:
+                         start_split_idx = split_names_resume.index(progress.get('split'))
+                         # Get start row only if config and split match
+                         start_row = progress.get('current_row', 0)
+                     except ValueError:
+                          print(f"Warning: Split '{progress.get('split')}' not found in resumed config '{config_to_resume}'. Starting config from first split.")
+                else: # No specific split saved, start config from first split
+                    start_split_idx = 0
+                    start_row = 0
+
             except ValueError:
-                print(f"Warning: Config '{progress.get('config')}' from progress file not found in selected configs. Starting from the first selected config.")
+                print(f"Warning: Config '{progress.get('config')}' from progress file not found. Starting from first selected config.")
+            except Exception as e_resume_load:
+                 print(f"Warning: Error determining resume point from dataset structure: {e_resume_load}. Starting from beginning.")
+                 start_config_idx = 0
+                 start_split_idx = 0
+                 start_row = 0
+
 
         # Process each config
         for config_idx in range(start_config_idx, len(selected_configs)):
@@ -809,29 +994,26 @@ def main():
             print(f"\n--- Processing Config: {config_name_str} ---")
 
             try:
-                 # Load dataset config (consider streaming for very large ones if memory becomes an issue)
-                 ds = load_dataset(dataset_id, config, download_mode='reuse_cache_if_exists')
+                 ds = load_dataset(dataset_id, config, download_mode='reuse_cache_if_exists', trust_remote_code=True)
             except Exception as e:
                  print(f"Error loading dataset config '{config_name_str}': {e}. Skipping.")
                  continue
 
             # Handle splits within the config
             splits_to_process = {}
+            split_names = []
             if isinstance(ds, dict):
                  splits_to_process = ds
+                 split_names = list(ds.keys())
             else:
-                 splits_to_process["train"] = ds # Assume 'train' if not a dict
-
-            start_split_idx = 0
-            split_names = list(splits_to_process.keys())
-            if args.resume and progress and progress.get('config') == config:
-                 try:
-                      start_split_idx = split_names.index(progress.get('split'))
-                 except ValueError:
-                      print(f"Warning: Split '{progress.get('split')}' not found in config '{config_name_str}'. Processing all splits.")
+                 split_name_guess = ds.split if hasattr(ds, 'split') and ds.split else 'train'
+                 splits_to_process[split_name_guess] = ds
+                 split_names = [split_name_guess]
 
 
-            for split_idx in range(start_split_idx, len(split_names)):
+            current_start_split_idx = start_split_idx if config_idx == start_config_idx else 0
+
+            for split_idx in range(current_start_split_idx, len(split_names)):
                 split_name = split_names[split_idx]
                 split_ds = splits_to_process[split_name]
                 print(f"\nTranslating Split: {split_name} ({len(split_ds)} examples)")
@@ -842,10 +1024,12 @@ def main():
                     print(f"Test mode: processing only {len(split_ds)} examples.")
 
                 total_examples = len(split_ds)
-                start_row = 0
-                if args.resume and progress and progress.get('config') == config and progress.get('split') == split_name:
-                    start_row = progress.get('current_row', 0)
-                    print(f"Resuming {split_name} from row {start_row}")
+                # Determine start row for this specific split
+                current_start_row = start_row if config_idx == start_config_idx and split_idx == current_start_split_idx else 0
+
+                if current_start_row >= total_examples:
+                     print(f"Skipping split {split_name} as resume point ({current_start_row}) is beyond total examples ({total_examples}).")
+                     continue
 
                 # Define save path using HF standard (data/<config>/<split>.parquet)
                 config_output_dir = os.path.join(work_dir, "data", config_name_str)
@@ -854,21 +1038,27 @@ def main():
                 temp_chunk_dir = os.path.join(config_output_dir, f"chunks_{split_name}")
                 os.makedirs(temp_chunk_dir, exist_ok=True)
 
-
                 # Process in chunks
-                for chunk_start in range(start_row, total_examples, chunk_size):
+                for chunk_start in range(current_start_row, total_examples, chunk_size):
                     chunk_end = min(chunk_start + chunk_size, total_examples)
                     print(f"\nProcessing rows {chunk_start} to {chunk_end-1}...")
 
                     # Get the chunk
-                    chunk_ds = split_ds.select(range(chunk_start, chunk_end))
+                    try:
+                         chunk_ds = split_ds.select(range(chunk_start, chunk_end))
+                    except Exception as e_select:
+                         print(f"Error selecting chunk {chunk_start}-{chunk_end-1}: {e_select}")
+                         continue # Skip this chunk
 
                     # Translate the chunk
                     try:
+                         # Clear cache hash warning check for each map call if possible?
+                         # warnings.filterwarnings("ignore", category=UserWarning, message="Parameter 'fn_kwargs'") # Use cautiously
+
                          translated_chunk_ds = chunk_ds.map(
                               translate_batch,
                               batched=True,
-                              batch_size=64, # How many rows .map processes together
+                              batch_size=min(64, chunk_size), # Adjust map batch_size relative to chunk_size
                               fn_kwargs={
                                   "selected_cols": selected_cols,
                                   "client": client,
@@ -877,7 +1067,7 @@ def main():
                                   "use_parallel": args.parallel,
                                   "workers": args.workers,
                                   "use_batching": args.batch,
-                                  "batch_size": args.batch_size, # arg for AWS batching
+                                  "batch_size": args.batch_size,
                                   "provider": provider,
                                   "openai_model": openai_model
                               },
@@ -887,21 +1077,18 @@ def main():
                          # Save translated chunk to a temporary file
                          chunk_file = os.path.join(temp_chunk_dir, f"chunk_{chunk_start}_{chunk_end}.parquet")
                          translated_chunk_ds.to_parquet(chunk_file)
-                         # print(f"Saved chunk: {chunk_file}") # Optional verbose logging
 
                          # Update and save progress
                          save_progress(work_dir, config, split_name, chunk_end, selected_cols, dataset_id, selected_configs, provider, openai_model)
 
                     except KeyboardInterrupt:
                          print("\nProcess interrupted by user.")
-                         # Save progress at the start of the interrupted chunk
                          save_progress(work_dir, config, split_name, chunk_start, selected_cols, dataset_id, selected_configs, provider, openai_model)
                          print(f"Progress saved at row {chunk_start}. To resume, use the same work directory:\n{work_dir}")
                          return # Exit cleanly
                     except Exception as e_map:
                          print(f"\nError during translation map operation for chunk {chunk_start}-{chunk_end-1}: {e_map}")
                          print("Skipping this chunk, progress saved before chunk.")
-                         # Save progress at the start of the failed chunk
                          save_progress(work_dir, config, split_name, chunk_start, selected_cols, dataset_id, selected_configs, provider, openai_model)
                          continue # Try next chunk
 
@@ -909,15 +1096,15 @@ def main():
                 print(f"\nCombining translated chunks for split: {split_name}...")
                 try:
                     chunk_files = [os.path.join(temp_chunk_dir, f) for f in os.listdir(temp_chunk_dir) if f.startswith("chunk_") and f.endswith(".parquet")]
-                    # Sort chunks numerically by start index
-                    chunk_files.sort(key=lambda x: int(os.path.basename(x).split('_')[1]))
-
                     if not chunk_files:
                          print(f"Warning: No translated chunk files found for split {split_name}. Skipping combination.")
                          continue
 
+                    chunk_files.sort(key=lambda x: int(os.path.basename(x).split('_')[1])) # Sort numerically
+
+                    print(f"Found {len(chunk_files)} chunk files to combine.")
                     # Load all chunks and concatenate
-                    all_chunk_datasets = [load_dataset("parquet", data_files=cf, split='train') for cf in chunk_files] # Load each chunk as 'train' split
+                    all_chunk_datasets = [load_dataset("parquet", data_files=cf, split='train') for cf in chunk_files]
                     combined_ds = concatenate_datasets(all_chunk_datasets)
 
                     # Save the final combined split file
@@ -925,17 +1112,20 @@ def main():
                     print(f"Saved combined translated data to: {final_split_path}")
 
                     # Clean up temporary chunk files and directory
-                    for cf in chunk_files:
-                        os.remove(cf)
+                    for cf in chunk_files: os.remove(cf)
                     os.rmdir(temp_chunk_dir)
                     print("Cleaned up temporary chunk files.")
 
                 except Exception as e_combine:
                     print(f"Error combining chunks for split {split_name}: {e_combine}")
-                    print("Temporary chunk files preserved in:", temp_chunk_dir)
+                    print(f"Temporary chunk files preserved in: {temp_chunk_dir}")
 
-            # Reset progress split to None after finishing all splits in a config,
-            # so resume starts next config correctly
+                # Reset start_row for next split within the same config/resume cycle
+                start_row = 0
+
+            # Reset start_split_idx for next config
+            start_split_idx = 0
+            # Save progress indicating config done (split=None)
             save_progress(work_dir, config, None, 0, selected_cols, dataset_id, selected_configs, provider, openai_model)
 
 
@@ -944,11 +1134,14 @@ def main():
 
         # Create README and dataset_infos.yaml
         print("\nCreating metadata files (README.md, dataset_infos.yaml)...")
-        create_readme_and_yaml(work_dir, selected_configs, dataset_id, provider, openai_model)
+        # Pass repo_name obtained earlier
+        create_readme_and_yaml(work_dir, selected_configs, dataset_id, provider, openai_model, repo_name)
 
         # --- Upload to Hugging Face Hub ---
         print(f"\nPreparing repository '{repo_name}' for upload...")
-        if token:
+        # Use token obtained earlier if not resuming, otherwise prompt again if needed?
+        # Current logic doesn't re-ask for token if resuming, relies on CLI login.
+        if token and not args.resume: # Only auto-login if token provided on initial run
             try:
                 login(token=token)
                 print("Logged in to Hugging Face Hub using provided token.")
@@ -957,14 +1150,12 @@ def main():
 
         if not prepare_repository(repo_dir, repo_name, token):
             print("Error: Failed to setup repository.")
-            # Backup locally if repo setup failed
             backup_dir = os.path.join(os.getcwd(), f"translated_{dataset_id.replace('/','_')}_backup")
             try:
-                 if os.path.exists(backup_dir): shutil.rmtree(backup_dir) # Remove old backup
-                 shutil.copytree(work_dir, backup_dir, ignore=shutil.ignore_patterns('hf_repo')) # Exclude repo clone dir
+                 if os.path.exists(backup_dir): shutil.rmtree(backup_dir)
+                 shutil.copytree(work_dir, backup_dir, ignore=shutil.ignore_patterns('hf_repo'))
                  print(f"\nTranslation results saved locally (excluding repo clone) to:\n{backup_dir}")
-            except Exception as e_backup:
-                 print(f"Error creating local backup: {e_backup}")
+            except Exception as e_backup: print(f"Error creating local backup: {e_backup}")
             return
 
         # Copy translated data ('data' dir) and metadata files into the repo dir
@@ -975,26 +1166,30 @@ def main():
              if os.path.exists(data_dst): shutil.rmtree(data_dst)
              if os.path.exists(data_src): shutil.copytree(data_src, data_dst)
 
-             shutil.copy2(os.path.join(work_dir, "README.md"), repo_dir)
-             shutil.copy2(os.path.join(work_dir, "dataset_infos.yaml"), repo_dir)
+             readme_src = os.path.join(work_dir, "README.md")
+             yaml_src = os.path.join(work_dir, "dataset_infos.yaml")
+             if os.path.exists(readme_src): shutil.copy2(readme_src, repo_dir)
+             if os.path.exists(yaml_src): shutil.copy2(yaml_src, repo_dir)
         except Exception as e_copy:
-             print(f"Error copying files to repository directory: {e_copy}")
-             return
+             print(f"Error copying files to repository directory: {e_copy}"); return
 
         # Push to Hugging Face
         print("\nAttempting to push translated dataset to Hugging Face Hub...")
         try:
-            # Add all changes
-            subprocess.run(['git', 'add', '.'], cwd=repo_dir, check=True, capture_output=True)
-            # Check if there are changes to commit
+            subprocess.run(['git', 'add', 'data/*', 'README.md', 'dataset_infos.yaml', '.gitattributes'], cwd=repo_dir, check=True)
             status_result = subprocess.run(['git', 'status', '--porcelain'], cwd=repo_dir, check=True, capture_output=True, text=True)
             if status_result.stdout:
-                 commit_msg = f"Add translated dataset ({provider})"
-                 subprocess.run(['git', 'commit', '-m', commit_msg], cwd=repo_dir, check=True, capture_output=True)
+                 commit_msg = f"Add/update translated dataset ({provider}, model: {openai_model if provider=='openai' else 'N/A'})"
+                 subprocess.run(['git', 'commit', '-m', commit_msg], cwd=repo_dir, check=True)
                  print("Committing changes...")
-                 # Push
-                 print(f"Pushing to {repo_name}...")
-                 push_result = subprocess.run(['git', 'push', '-u', 'origin', 'main'], cwd=repo_dir, check=True, capture_output=True, text=True)
+                 # Determine current branch (usually main or master)
+                 branch_result = subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=repo_dir, check=True, capture_output=True, text=True)
+                 current_branch = branch_result.stdout.strip()
+                 if not current_branch: current_branch = 'main' # Default assumption
+
+                 print(f"Pushing to origin/{current_branch}...")
+                 # Use --force-with-lease for potentially safer force pushes if needed, but start without
+                 push_result = subprocess.run(['git', 'push', '-u', 'origin', current_branch], cwd=repo_dir, check=True, stderr=subprocess.PIPE, text=True)
                  print("Push successful!")
                  print(f"Dataset available at: https://huggingface.co/datasets/{repo_name}")
             else:
@@ -1002,15 +1197,13 @@ def main():
 
         except subprocess.CalledProcessError as e_push:
             print(f"\nError pushing to Hugging Face repository: {e_push}")
-            print(f"Stderr: {e_push.stderr.decode() if e_push.stderr else 'N/A'}")
-            # Backup locally on push failure
+            print(f"Stderr: {e_push.stderr if e_push.stderr else 'N/A'}")
             backup_dir = os.path.join(os.getcwd(), f"translated_{dataset_id.replace('/','_')}_backup")
             try:
-                 if os.path.exists(backup_dir): shutil.rmtree(backup_dir) # Remove old backup
+                 if os.path.exists(backup_dir): shutil.rmtree(backup_dir)
                  shutil.copytree(work_dir, backup_dir, ignore=shutil.ignore_patterns('hf_repo'))
                  print(f"\nTranslation results saved locally (excluding repo clone) to:\n{backup_dir}")
-            except Exception as e_backup:
-                 print(f"Error creating local backup: {e_backup}")
+            except Exception as e_backup: print(f"Error creating local backup: {e_backup}")
         except Exception as e_git:
              print(f"An unexpected error occurred during git operations: {e_git}")
 

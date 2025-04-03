@@ -10,7 +10,7 @@ Este repositorio contiene scripts para traducir datasets de Hugging Face del ing
 -   Traducción de inglés a español usando **AWS Translate** o **OpenAI API** (e.g., GPT-4o mini).
 -   Preservación completa de la estructura de datasets (configs, splits).
 -   Traducción selectiva de columnas específicas.
--   Manejo especial para columnas de tipo conversación (formato lista de diccionarios).
+-   Manejo especial para columnas de tipo conversación (`conversation` o `conversations`).
 -   Caché global opcional para evitar retraducciones de contenido repetido (ej. system prompts idénticos).
 -   Procesamiento en paralelo y traducción por lotes (batching) para eficiencia.
 -   Progreso guardado automáticamente, permitiendo reanudar procesos interrumpidos.
@@ -28,13 +28,15 @@ Este repositorio contiene scripts para traducir datasets de Hugging Face del ing
 -   **openai**: Para traducción con OpenAI (requerido si se usa `--provider openai`).
 -   **git** y **git-lfs**: Para preparar y publicar datasets en Hugging Face Hub.
 
-Instala las dependencias con:
+Instala las dependencias con (se recomienda usar un entorno virtual):
 
 ```bash
 pip install -r requirements.txt
+# O para actualizar/reinstalar:
+# pip install --upgrade -r requirements.txt
 ```
 
-Asegúrate también de tener `git` y `git-lfs` instalados en tu sistema.
+Asegúrate también de tener `git` y `git-lfs` instalados en tu sistema y accesibles desde la línea de comandos.
 
 ## Configuración
 
@@ -48,14 +50,7 @@ export AWS_SECRET_ACCESS_KEY=tu_secret_key
 export AWS_DEFAULT_REGION=tu_region_preferida # ej: us-east-1
 ```
 
-Alternativamente, puedes usar el archivo `~/.aws/credentials`:
-
-```ini
-[default]
-aws_access_key_id = tu_access_key
-aws_secret_access_key = tu_secret_key
-region = tu_region_preferida
-```
+Alternativamente, puedes usar el archivo `~/.aws/config` y `~/.aws/credentials`.
 
 ### Para OpenAI:
 
@@ -106,15 +101,16 @@ python main.py --batch --batch-size 5
 # Especificar el proveedor de traducción (aws o openai)
 python main.py --provider openai
 
+# Especificar el modelo de OpenAI a usar (si es diferente al default)
+python main.py --provider openai --openai-model gpt-4o-mini
+
 # Ajustar el tamaño del bloque (chunk) para guardar progreso (default: 100)
 python main.py --chunk-size 200
 
 # Cambiar el número de reintentos para llamadas API fallidas (default: 3)
 python main.py --retries 5
 
-# Habilitar caché global para contenido repetitivo (útil para system prompts)
-# (Nota: El comportamiento por defecto en el código actual es tenerlo activado,
-#  pero este flag aseguraría la activación si el default cambia)
+# Habilitar caché global para contenido repetitivo (activado por defecto)
 python main.py --global-cache
 ```
 
@@ -131,10 +127,10 @@ python calculate-translation-cost.py --dataset nombre/dataset --configs subset1,
 
 # Analizar usando una muestra y extrapolar (RECOMENDADO para datasets grandes)
 # Analiza los primeros 1000 ejemplos y estima el costo total
-python calculate-translation-cost.py --dataset nombre/dataset --sample 1000 --extrapolate
+python calculate-translation-cost.py --dataset Org/DatasetName --sample 1000 --extrapolate
 
 # Analizar solo columnas específicas que contienen texto a traducir
-python calculate-translation-cost.py --dataset nombre/dataset --columns texto_principal,descripcion --sample 500 --extrapolate
+python calculate-translation-cost.py --dataset Org/DatasetName --columns texto_principal,descripcion --sample 500 --extrapolate
 ```
 
 ## Proceso de Traducción (`main.py`)
@@ -144,26 +140,26 @@ python calculate-translation-cost.py --dataset nombre/dataset --columns texto_pr
 3.  **Selección de Columnas**: Elige qué columnas contienen el texto a traducir.
 4.  **Traducción Incremental**: El script procesa el dataset en bloques (`--chunk-size`), traduciendo el texto seleccionado usando el proveedor elegido (`--provider`). Guarda el progreso automáticamente después de cada bloque.
 5.  **Combinación**: Una vez que todos los bloques de un split son traducidos, se combinan en un único archivo Parquet final para ese split.
-6.  **Metadatos**: Se generan los archivos `README.md` y `dataset.yaml` para el nuevo dataset traducido.
+6.  **Metadatos**: Se generan los archivos `README.md` y `dataset_infos.yaml` para el nuevo dataset traducido.
 7.  **Publicación**: Intenta subir el dataset completo (archivos Parquet y metadatos) a un repositorio nuevo o existente en Hugging Face Hub. Si falla, guarda un backup localmente.
 
 ## Manejo de Casos Especiales
 
--   **System prompts**: Si se usa `--global-cache`, los prompts de sistema idénticos encontrados en la columna `system` (o la configurada) se traducen una sola vez y se reutiliza la traducción.
--   **Conversaciones**: Para columnas llamadas `conversations`, el script intenta interpretar el contenido como una lista de diccionarios (ej. `[{'role': 'user', 'value': '...'}, ...]`) y traduce únicamente el texto dentro de los campos `value`.
+-   **System prompts**: Si se usa `--global-cache`, los prompts de sistema idénticos encontrados en la columna `system` se traducen una sola vez y se reutiliza la traducción.
+-   **Conversaciones**: Para columnas llamadas `conversation` o `conversations`, el script intenta interpretar el contenido como una lista de diccionarios (ej. `[{'from': 'user', 'value': '...'}, ...]`) y traduce únicamente el texto dentro de los campos `value`.
 -   **Textos Largos**: Los textos que exceden los límites de caracteres/tokens de la API de traducción (AWS o OpenAI) se dividen automáticamente en fragmentos más pequeños (intentando respetar frases/párrafos) antes de la traducción y se vuelven a unir después.
 -   **Errores de API**: Se realizan reintentos automáticos (`--retries`) con un pequeño tiempo de espera si la API de traducción devuelve un error temporal. Si la traducción de un texto falla repetidamente, se mantiene el texto original.
 
 ## Estructura del Dataset Resultante en Hugging Face
 
-El script organiza el dataset traducido para que sea fácilmente cargable con `load_dataset`.
+El script organiza el dataset traducido siguiendo el estándar de Hugging Face Datasets.
 
 ```
 nombreusuario/repo-traducido/
 ├── .gitattributes           # Asegura manejo LFS para Parquet
 ├── README.md                # Descripción autogenerada del dataset traducido
-├── dataset.yaml             # Configuración de carga (configs, splits, archivos)
-└── configs/
+├── dataset_infos.yaml       # Configuración de carga (configs, splits, archivos)
+└── data/
     ├── default/             # Config "default" (si no había nombres específicos)
     │   ├── train.parquet    # Archivo Parquet con el split "train" traducido (LFS)
     │   └── test.parquet     # Archivo Parquet con el split "test" traducido (LFS)
